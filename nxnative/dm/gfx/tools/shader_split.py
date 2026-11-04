@@ -257,21 +257,24 @@ def idrk_shaders(path, label, out):
 
 G2S, SPKG = b'_S2G3000', b'SPKG'
 def kt_gz(d):
-    """Koei Tecmo's older chunked zlib (Fire Emblem: Three Houses: the compressed entries of DATA1.bin and the patch*/…/*.gz files): u32 chunk size (0x10000), u32 chunk count, u32 inflated length,
+    """Koei Tecmo's chunked zlib: u32 chunk size (Three Houses: 64 KiB; DQB2 also uses 128 KiB, 256 KiB and 2 MiB), u32 chunk count, u32 inflated length,
     u32 stored length of each chunk, then the chunks at 0x80 alignment, each a u32 length + one zlib stream, or the plain bytes when the stored length equals the chunk's inflated length (a short last
     chunk, or one that does not compress). → the inflated data, or None when d is not in that form"""
     import zlib
     if len(d) < 16: return None
     cs, n, tot = struct.unpack_from('<III', d)
-    if cs != 0x10000 or not n or n != (tot + cs - 1) // cs or 12 + 4 * n > len(d): return None
+    if not cs or cs & (cs - 1) or not n or n != (tot + cs - 1) // cs or 12 + 4 * n > len(d): return None
     sizes = struct.unpack_from(f'<{n}I', d, 12); o = (12 + 4 * n + 0x7f) & ~0x7f; out = []
     for i, s in enumerate(sizes):
         if o + s > len(d): return None
         if s == min(cs, tot - i * cs): out.append(bytes(d[o:o + s]))
         else:
+            if s < 4: return None
             ln = struct.unpack_from('<I', d, o)[0]
+            if ln > s - 4: return None
             try: out.append(zlib.decompress(d[o + 4:o + 4 + ln]))
             except zlib.error: return None
+        if len(out[-1]) != min(cs, tot - i * cs): return None
         o = (o + s + 0x7f) & ~0x7f
     return b''.join(out)
 
@@ -284,23 +287,42 @@ def kt_shaders(d, label, out):
     if b'\x91\x68\x86\x19' in d: out.extend(glslc_shaders(d, label, need=False))
     if d[:4] == b'SARC' or b'BNSH\0\0\0\0' in d: scan_blob(d, label, out)
 
+def linkdata_entries(path):
+    """KTGL's 32-byte LINKDATA index: {offset, inflated length, stored length, compressed}. Three Houses names the pair DATA0.bin/DATA1.bin;
+    DQB2 uses LINKDATA.IDX/LINKDATA.BIN. Recognize same-stem BIN/IDX pairs by their bounded records, independent of the game or archive name."""
+    stem, ext = os.path.splitext(path)
+    if os.path.basename(path) == 'DATA1.bin': candidates = [os.path.join(os.path.dirname(path), 'DATA0.bin')]
+    elif ext.lower() == '.bin': candidates = [stem + '.IDX', stem + '.idx']
+    else: return None
+    for idx in candidates:
+        if not os.path.isfile(idx): continue
+        with open(idx, 'rb') as f: raw = f.read()
+        if not raw or len(raw) % 32: continue
+        ents = list(struct.iter_unpack('<QQQQ', raw)); size = os.path.getsize(path)
+        if not any(n for _, n, _, _ in ents): continue
+        if any(n and (comp not in (0, 1) or off > size or not 0 < (stored if comp else n) <= size - off) for off, n, stored, comp in ents): continue
+        return ents
+    return None
+
 def linkdata_jobs(path, rel, parts=64):
-    """Three Houses' LINKDATA: DATA0.bin, beside DATA1.bin (6.9 GB), indexes it with 32-byte entries {u64 offset, u64 inflated length, u64 stored length, u64 compressed}. The entries are split into
-    ranges of about equal stored size, one scan job each. → [(path, rel, (first entry, end entry)), …], or None when there is no index beside the file"""
-    idx = os.path.join(os.path.dirname(path), 'DATA0.bin')
-    if os.path.basename(path) != 'DATA1.bin' or not os.path.exists(idx): return None
-    n = os.path.getsize(idx) // 32; step = os.path.getsize(path) / parts; jobs, lo = [], 0
-    with open(idx, 'rb') as f: ents = [struct.unpack('<QQQQ', f.read(32)) for _ in range(n)]
+    """Split a bounded LINKDATA index into ranges of about equal stored size, one scan job each.
+    → [(path, rel, (first entry, end entry)), …], or None without a matching index."""
+    ents = linkdata_entries(path)
+    if ents is None: return None
+    n = len(ents); step = os.path.getsize(path) / parts; jobs, lo = [], 0
     for i in range(1, n + 1):
         if i == n or ents[i][0] >= (len(jobs) + 1) * step: jobs.append((path, rel, (lo, i))); lo = i
     return jobs
 
 def linkdata_shaders(path, rel, rng, out):
     import mmap
-    with open(os.path.join(os.path.dirname(path), 'DATA0.bin'), 'rb') as f: idx = f.read()
+    ents = linkdata_entries(path)
+    if ents is None:
+        red(f'{path}: no bounded LINKDATA index')
+        return
     with open(path, 'rb') as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as d:
         for i in range(*rng):
-            off, n, stored, comp = struct.unpack_from('<QQQQ', idx, i * 32)
+            off, n, stored, comp = ents[i]
             if n: kt_shaders(d[off:off + (stored if comp else n)], f'/{rel}#{i}', out)
 
 KPKA = b'KPKA'

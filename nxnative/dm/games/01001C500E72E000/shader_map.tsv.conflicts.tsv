@@ -1,0 +1,2 @@
+# Keys include the control section and code area; no conflict rulings.
+dm_ctl_sha16	chosen_pc	class	candidates	records

@@ -84,13 +84,65 @@ HLE_FORCE("nnsocketGetHostByNameWithOptions", "name resolution (cut): NULL", voi
 HLE_FORCE("nnsocketGetLastErrno", "socket error code kept by the host", int, h_nsk_GetErrno, void) { return t_skerr; }
 HLE_FORCE("nnsocketSetLastErrno", "socket error code kept by the host", void, h_nsk_SetErrno, int e) { t_skerr = e; }
 
-// ---------- ssl: offline, Initialize succeeds (the network library's global initialization depends on it), everything else that contacts the service fails ----------
-// Not cut: Context / Connection construction and destruction, Context::GetContextId (only read and write game objects).
+// ---------- ssl: context allocation does not require an available network ----------
+// SDK 5 offline startup allocates a context before opening a connection; failure unwinds partially initialized resources.
+// The SSL service creates a context before a socket exists (libnx sslCreateContext); only a connection needs a network. Keep actual context state here, while
+// connection operations below still fail offline. SDK 5's Context constructor clears its one opaque 64-bit word; all service-facing context methods must use
+// the host registry rather than letting the original SDK interpret a host token as its encoded IPC-object pointer. The original constructor/destructor stay intact.
 #define SSF(m, cname, ...) HLE_FORCE(m, "ssl service (cut): fails", Result, cname, __VA_ARGS__)
 HLE_FORCE("_ZN2nn3ssl10InitializeEv", "same as nnsslInitialize: succeeds, creates no session (cut)", Result, h_ssl_InitCpp, void) { return RES_OK; }
 HLE_FORCE("_ZN2nn3ssl8FinalizeEv", "pairs with Initialize (cut)", Result, h_ssl_FinCpp, void) { return RES_OK; }
-SSF("_ZN2nn3ssl7Context6CreateENS1_10SslVersionE", h_ssl_CtxCreate, void *self, int v) { (void)self; (void)v; return RES_FAIL; }
-SSF("_ZN2nn3ssl7Context7DestroyEv", h_ssl_CtxDestroy, void *self) { (void)self; return RES_FAIL; }
+typedef struct ssl_ctx { struct ssl_ctx *next; void *owner; uint64_t id; uint32_t version; int crl_date_check; } ssl_ctx;
+static pthread_mutex_t g_ssl_lock = PTHREAD_MUTEX_INITIALIZER;
+static ssl_ctx *g_ssl_contexts;
+static uint64_t g_ssl_next_id;
+static ssl_ctx **ssl_context(void *self) {   // caller holds g_ssl_lock; copying a Context does not transfer ownership
+    ssl_ctx **p = &g_ssl_contexts;
+    while (*p && ((*p)->owner != self || (*p)->id != *(uint64_t *)self)) p = &(*p)->next;
+    return p;
+}
+HLE_FORCE("_ZN2nn3ssl7Context6CreateENS1_10SslVersionE", "allocate a local SSL context; no socket or network request", Result, h_ssl_CtxCreate, void *self, int v) {
+    // SslVersion: Auto, TLS 1.0..1.3, Auto24 (libnx ssl.h). Zero and unknown bits are invalid.
+    if (!self || !v || ((uint32_t)v & ~0x01000079u)) return RES_FAIL;
+    pthread_mutex_lock(&g_ssl_lock);
+    if (*ssl_context(self)) { pthread_mutex_unlock(&g_ssl_lock); return RES_FAIL; }
+    ssl_ctx *c = calloc(1, sizeof *c);
+    if (!c) { pthread_mutex_unlock(&g_ssl_lock); return RES_FAIL; }
+    c->owner = self; c->id = ++g_ssl_next_id; c->version = (uint32_t)v; c->crl_date_check = 1;
+    c->next = g_ssl_contexts; g_ssl_contexts = c; *(uint64_t *)self = c->id;
+    pthread_mutex_unlock(&g_ssl_lock);
+    return RES_OK;
+}
+HLE_FORCE("_ZN2nn3ssl7Context7DestroyEv", "release the local SSL context", Result, h_ssl_CtxDestroy, void *self) {
+    if (!self) return RES_FAIL;
+    pthread_mutex_lock(&g_ssl_lock);
+    ssl_ctx **p = ssl_context(self), *c = *p;
+    if (c) { *p = c->next; *(uint64_t *)self = 0; free(c); }
+    pthread_mutex_unlock(&g_ssl_lock);
+    return c ? RES_OK : RES_FAIL;
+}
+HLE_FORCE("_ZN2nn3ssl7Context12GetContextIdEPm", "read the local SSL context ID", Result, h_ssl_CtxId, void *self, uint64_t *id) {
+    if (!self || !id) return RES_FAIL;
+    pthread_mutex_lock(&g_ssl_lock);
+    ssl_ctx *c = *ssl_context(self); *id = c ? c->id : 0;
+    pthread_mutex_unlock(&g_ssl_lock);
+    return c ? RES_OK : RES_FAIL;
+}
+HLE_FORCE("_ZN2nn3ssl7Context9SetOptionENS1_13ContextOptionEi", "set the local SSL context CRL date-check option", Result, h_ssl_CtxSetOpt, void *self, int option, int value) {
+    if (!self || option != 1 || (value != 0 && value != 1)) return RES_FAIL;
+    pthread_mutex_lock(&g_ssl_lock);
+    ssl_ctx *c = *ssl_context(self); if (c) c->crl_date_check = value;
+    pthread_mutex_unlock(&g_ssl_lock);
+    return c ? RES_OK : RES_FAIL;
+}
+HLE_FORCE("_ZN2nn3ssl7Context9GetOptionEPiNS1_13ContextOptionE", "read the local SSL context CRL date-check option", Result, h_ssl_CtxGetOpt, void *self, int *value, int option) {
+    if (!self || !value || option != 1) return RES_FAIL;
+    pthread_mutex_lock(&g_ssl_lock);
+    ssl_ctx *c = *ssl_context(self); if (c) *value = c->crl_date_check;
+    pthread_mutex_unlock(&g_ssl_lock);
+    return c ? RES_OK : RES_FAIL;
+}
+SSF("_ZN2nn3ssl7Context12AddPolicyOidEPKcj", h_ssl_CtxPolicy, void *self, const char *oid, unsigned n) { (void)self; (void)oid; (void)n; return RES_FAIL; }
 SSF("_ZN2nn3ssl7Context19RegisterInternalPkiEPmNS1_11InternalPkiE", h_ssl_CtxRegPki, void *self, uint64_t *id, int p) { (void)self; (void)id; (void)p; return RES_FAIL; }
 SSF("_ZN2nn3ssl7Context9RemovePkiEm", h_ssl_CtxRemovePki, void *self, uint64_t id) { (void)self; (void)id; return RES_FAIL; }
 SSF("_ZN2nn3ssl14BuiltInManager28GetBuiltInCertificateBufSizeEPjPNS0_15CaCertificateIdEj", h_ssl_BiBufSize, uint32_t *o, void *ids, unsigned n) { (void)ids; (void)n; if (o) *o = 0; return RES_FAIL; }

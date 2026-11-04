@@ -11,7 +11,7 @@ This is the Android port of [nxnative](https://github.com/seedds/nxnative), whic
 
 ## Games
 
-These games play on Android. Tested on a Lenovo Legion Y700 (Snapdragon 8 Elite, Adreno 830). The device's GPU must read BC-compressed textures (Adreno, Xclipse; not Mali or PowerVR).
+The main table lists games that play on Android. Tested on a Lenovo Legion Y700 (Snapdragon 8 Elite, Adreno 830). The device's GPU must read BC-compressed textures (Adreno, Xclipse; not Mali or PowerVR).
 
 | | |
 |:---:|:---:|
@@ -32,7 +32,13 @@ These games play on Android. Tested on a Lenovo Legion Y700 (Snapdragon 8 Elite,
 
 The tag (`v0.1.3`) is the latest nx2android version the game was tested on. Older games are not tested again for each release: if a later version breaks one, a patch release fixes it. A tag newer than the [latest release](https://github.com/shirai91/nx2android/releases/latest) is the next release, and the game needs the development checkout until it ships.
 
-A game that is not in this table is not supported yet. The games we look at next, and the ones done: [docs/PORT_CHECKLIST.md](docs/PORT_CHECKLIST.md).
+A game absent from these tables has no verified Android port yet. The games we look at next, and the ones done: [docs/PORT_CHECKLIST.md](docs/PORT_CHECKLIST.md).
+
+### Boots only
+
+| Game | Verified on Android |
+|---|---|
+| DRAGON QUEST BUILDERS 2 | `v0.2.0` development checkout · HK update 1.7.3 · PJD110 / Adreno 750 · title screen with the stock driver; gameplay unverified |
 
 ## For players: port a game without programming
 

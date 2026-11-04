@@ -14,6 +14,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 TOOLS = HERE.parent.parent / 'gfx/tools'
 sys.path.insert(0, str(TOOLS))
+from spirv_portable import inline_subgroup_helpers, subgroup_helpers
 import dmsh_facts, dmsh_chain   # noqa: E402  (DM_GAME picks the profile)
 
 ap = argparse.ArgumentParser()
@@ -21,6 +22,7 @@ ap.add_argument('pkg'); ap.add_argument('out')
 ap.add_argument('--jobs', type=int, default=os.cpu_count() or 8)
 ap.add_argument('--keys', default='')
 ap.add_argument('--dotnet', default=os.environ.get('DOTNET', 'dotnet'))
+ap.add_argument('--spirv-opt', default='spirv-opt', help='NDK SPIR-V optimizer: inline subgroup helper functions for mobile drivers')
 ap.add_argument('--capture', help='a folder of shaders captured at run time on the device (<key>.bin)')
 ap.add_argument('--xlate', help="the translator (dmsh_xlate.dll) to run (default: the iOS chain's dm/gfx/tools/dmsh_xlate_bin; the porter builds one from the in-repo source)")
 a = ap.parse_args()
@@ -286,10 +288,13 @@ def main():
         for ln in r.stderr.splitlines():
             if ln.strip(): errs[ln.strip()[:120]] += 1
     entries, fails = [], collections.Counter()
+    inlined = 0
     for k in keys:
         spv_p, res_p = os.path.join(w, k + '.spv'), os.path.join(w, k + '.res.json')
         if not os.path.exists(spv_p): fails['no output'] += 1; continue
         spv = open(spv_p, 'rb').read(); res = json.load(open(res_p)) if os.path.exists(res_p) else {}
+        if subgroup_helpers(spv):
+            spv = inline_subgroup_helpers(spv, a.spirv_opt, os.path.join(w, k + '.portable.spv')); inlined += 1
         binds, local, io = spirv_bindings(spv)
         st = stages[k]
         cl = [classify(st, b, res) for b in binds]
@@ -297,6 +302,7 @@ def main():
         # header words 2-4: a compute shader's local size; a vertex shader's input locations (all, signed int, unsigned int); a pixel shader's output locations
         hdr3 = (local or jobs[k].get('local') or [1, 1, 1]) if st == 'cs' else io[1] if st == 'vs' else io[3] if st == 'ps' else [0, 0, 0]
         entries.append((int(k, 16), STAGES.get(st, 0), spv, refl_bin(cl, c1s[k], hdr3)))
+    print(f'subgroup helpers inlined in {inlined} shaders', flush=True)
     entries.sort(key=lambda e: e[0])
     hdr = struct.pack('<4sII', b'DMSV', 1, len(entries)); ent_sz = 32
     off = len(hdr) + ent_sz * len(entries); table, blobs = [], []

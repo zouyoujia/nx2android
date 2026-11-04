@@ -385,6 +385,14 @@ class UntaggedXci(unittest.TestCase):   # issue #28: a cartridge dump named by i
         self.xci('hr-bdlwa.xci', [('c.nca', self.nca(self.BASE + 0x800, 0)), ('d.cnmt.nca', self.nca(self.BASE + 0x800, 1))], key_area=True)
         self.assertEqual(pipeline.nsp.title_of(self.d / 'hr-bdlwa.xci', self.hk), self.BASE + 0x800)
 
+    def test_cartridge_patch_is_used_as_an_update(self):
+        self.xci('combined [v262144].xci', [('base.cnmt.nca', self.nca(self.BASE, 1)), ('patch.cnmt.nca', self.nca(self.BASE + 0x800, 1))])
+        app, fam = pipeline.nsp.scan_nsps(self.d, ('xci',), self.keys)
+        self.assertEqual(app, self.BASE)
+        self.assertEqual(fam['updates'], [(262144, fam['base'])])
+        have = pipeline.nsp.nsp_versions(fam, {})
+        self.assertEqual(have['v262144'], fam['base'])
+
     def test_without_keys_the_error_says_how(self):
         self.xci('hr-bdlwa.xci', [('d.cnmt.nca', self.nca(self.BASE, 1))])
         with self.assertRaisesRegex(pipeline.BuildError, r'hr-bdlwa\.xci: no ticket .*no prod\.keys.*\[01009D901BC56000\]\[v0\]'): pipeline.nsp.scan_nsps(self.d, ('nsp', 'xci'))

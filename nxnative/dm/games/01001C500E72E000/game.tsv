@@ -1,0 +1,37 @@
+# DRAGON QUEST BUILDERS 2, Hong Kong release, update 1.7.3. KTGL on SDK 5.4.0 / NVN.
+# Format: see dm/games/README.md. Build-specific addresses are not used by this profile.
+
+# ---- Identity ----
+title_id	01001C500E72E000
+program_id	01001C500E72E000
+
+# ---- App ----
+name	DRAGON QUEST BUILDERS 2
+ipa	DragonQuestBuilders2.ipa
+app_category	public.app-category.role-playing-games
+# The opening tutorial uses both sticks; retain the complete controller layout.
+pad_layout	full
+
+# ---- Versions ----
+build	v262144	1.7.3	main=173d12a38e9628133f2336d6c9e4b44b	subsdk0=2fa6e9856f72565f0b1c0bdbcc2b2c22	subsdk1=2e8d3a967b3539eb77f50d1647380378	sdk=f7c7b7a90ecdc2d41c97508cc7236b8a
+package	v262144
+shader_versions	v262144
+
+# ---- Files ----
+# main calls GLSLC and the SDK movie library, so both subsdks are required.
+modules	main subsdk0 subsdk1 sdk
+romfs_marker	LINKDATA.BIN
+zip_store	.bin:.idx:.mp4:.nx:.metallib
+
+# ---- Memory ----
+# NPDM system resource is zero: no virtual address memory. Startup requests a 3.02 GB heap in the 3.25 GB heap region.
+mem_reserve	0x100000000
+mem_alias	0x10000000
+mem_stack	0x10000000
+app_pool	0xCD500000
+sys_resource	0x0
+
+# ---- Shader split ----
+# Most shaders are in compressed LINKDATA members; six built-in outputs are compiled by subsdk0 at boot.
+shader_groups	/LINKDATA.BIN=assets /glslc_capture/=runtime /binary/=binary /movie/=movie
+shader_note	DRAGON QUEST BUILDERS 2 shaders

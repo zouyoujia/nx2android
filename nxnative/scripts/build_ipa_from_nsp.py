@@ -455,7 +455,14 @@ def scan_nsps(nsp_dir, exts=('nsp', 'xci'), keys=None):
         low = tid & 0xFFF   # base …000, update …800, DLC = base + 0x1000 + index
         app = tid if low == 0 else tid & ~0xFFF if low == 0x800 else (tid & ~0xFFF) - 0x1000
         f = fams.setdefault(app, {'base': None, 'updates': [], 'dlc': []})
-        if low == 0: f['base'] = p
+        if low == 0:
+            f['base'] = p
+            # A cartridge or merged NSP may carry the patch beside the application.
+            # Select the package for both roles; nx_extract filters each by content meta.
+            if hk and aes_ecb(hk[:16]):
+                with open(p, 'rb') as stream:
+                    tids = {meta_title(stream, off, hk) for name, off in dump_files(stream) if name.endswith('.nca')}
+                if app | 0x800 in tids: f['updates'].append((version_of(p), p))
         elif low == 0x800: f['updates'].append((version_of(p), p))
         else: f['dlc'].append((tid, version_of(p), p))
     if len(fams) == 1 and len(unknown) == 1 and next(iter(fams.values()))['base'] is None:   # a base game converted from a cartridge may have neither tags nor a ticket; build IDs are checked afterwards

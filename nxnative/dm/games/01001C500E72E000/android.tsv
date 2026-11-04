@@ -1,0 +1,8 @@
+# DRAGON QUEST BUILDERS 2, Hong Kong 1.7.3, KTGL / SDK 5.4.0.
+# PJD110 / Adreno 750, 2026-11-04: title screen confirmed with the stock driver.
+# Gameplay, save/reload and sustained progression remain unverified.
+status	boots
+tested	1.7.3 PJD110 (Adreno 750)
+package	org.nx2a.dqb2
+orientation	landscape
+requires	bcn

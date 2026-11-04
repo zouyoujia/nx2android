@@ -388,7 +388,13 @@ class Port:
             try: Adb(self.tools['adb'], self.o.device or self.cfg.get('device'), log=say).pick()
             except (AdbError, KeyError) as e: raise BuildError(f"{self.app_name}'s shaders are in Oodle-compressed archives ({self.oodle_why}): the port decodes them with the game's own decoder on "
                                                                f'the Android device, so connect it (adb) and port again ({e})') from e
-        for k in ('glslc_capture', 'ue_decode', 'ue_legacy') + (() if self.oodle_why else ('oodle_packs',)):
+        self.needs_glslc = src['glslc_capture'][0]
+        if self.needs_glslc:
+            want = nsp.glslc_wanted(self.g)
+            captured = bool(want and all(nsp.glslc_done(d / 'glslc_capture') >= want for d in self.dirs.values()))
+            if not captured and not (sys.platform == 'darwin' and nsp.apple_silicon()):
+                raise BuildError('runtime GLSLC shaders need a capture on an Apple Silicon Mac; no complete capture is available')
+        for k in ('ue_decode', 'ue_legacy') + (() if self.oodle_why else ('oodle_packs',)):
             if src[k][0]: raise BuildError(f'{self.app_name} needs a step that boots the game in the Mac host ({src[k][1]}), which the Android port cannot run yet')
 
     # ---- the game's own Oodle decoder on the device, for the shader split (Pokémon Legends: Arceus's GFPAKs, Pokémon Legends: Z-A's Trinity packs) ----
@@ -506,6 +512,13 @@ class Port:
     # ---- shaders: upstream's split, then SPIR-V for the Vulkan backend ----
     def shaders(self):
         sv = self.versions
+        if self.needs_glslc:
+            want = nsp.glslc_wanted(self.g)
+            if not (want and all(nsp.glslc_done(d / 'glslc_capture') >= want for d in self.dirs.values())):
+                PROG.add(2)   # Apple-target rewrite and runtime capture
+                mac = self.work / f'patched_{self.pkg_ver}'
+                nsp.rewrite(PY, NXNATIVE, self.game / 'ExeFS', mac, dict(self.env, DM_TARGET='apple'), self.logs, self.g)
+                nsp.capture_glslc(NXNATIVE, self.dirs, self.pkg_ver, mac, self.work, self.env, self.logs, self.g)
         pkg = self.work / 'shader' / 'pkg'
         try: nsp.split_shaders(PY, NXNATIVE, [self.dirs[v] / 'RomFS' for v in sv], [self.dirs[v] / 'ExeFS/main' for v in sv], pkg, self.env, self.logs, self.g, bool(self.derived or self.provisional),
                                oodle=self.device_oodle if self.oodle_why else None,   # Oodle-compressed archives: the game's own decoder on the device
@@ -515,14 +528,15 @@ class Port:
         PROG.stage('Vulkan shaders', step='building the translator')
         xlate, xkey = self.translator()
         PROG.set(step='checking the inputs')
-        key = nsp.fingerprint(nsp.package_key(pkg), ('files', [DM / 'android/tools/shader_vk.py'] + nsp.tool_files(NXNATIVE)), ('files', nsp.profile_files(self.g)), xkey,
+        spirv_opt = toolchain.ndk_shader_tool(self.tools['ndk'], 'spirv-opt')
+        key = nsp.fingerprint(nsp.package_key(pkg), ('cmd', [str(spirv_opt), '--version']), ('files', [DM / 'android/tools/shader_vk.py', DM / 'android/tools/spirv_portable.py'] + nsp.tool_files(NXNATIVE)), ('files', nsp.profile_files(self.g)), xkey,
                               ('files', sorted(cap.glob('*.bin'))))
         if self.dmsv.is_file() and (note := nsp.reused(kf, key)) is not None:
             PROG.end(f'{note}, reused (inputs unchanged)'); return
         tmp = self.dmsv.with_name('shaders.dmsv.partial'); nsp.rmtree(tmp); nsp.rmtree(kf)
         def line(s):
             if m := re.match(r'translating (\d+) shaders', s): PROG.set(step=f'translating {int(m.group(1)):,} shaders')
-        nsp.run([PY, DM / 'android/tools/shader_vk.py', pkg, tmp, '--jobs', str(self.o.jobs), '--dotnet', self.tools['dotnet'], '--xlate', xlate, '--capture', cap],
+        nsp.run([PY, DM / 'android/tools/shader_vk.py', pkg, tmp, '--jobs', str(self.o.jobs), '--dotnet', self.tools['dotnet'], '--xlate', xlate, '--capture', cap, '--spirv-opt', spirv_opt],
                 self.logs / 'android_shaders.log', env=self.env, on_line=line)
         m = re.search(r'^(\d+) of (\d+) shaders', (self.logs / 'android_shaders.log').read_text(errors='replace'), re.M)
         if not m or m.group(1) == '0': raise BuildError(f'no shader translated (see {self.logs / "android_shaders.log"})')

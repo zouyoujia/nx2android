@@ -138,3 +138,8 @@ def require(cfg=None, keys=None, adb=False):
     if bad: raise ToolError('missing requirements: ' + '; '.join(f'{r.name}: {r.detail}' + (f' ({r.fix})' if r.fix else '') for r in bad))
     by = {r.name: r for r in rows}
     return {'ndk': Path(by['Android NDK'].path), 'dotnet': Path(by['.NET SDK'].path), 'adb': Path(by['adb'].path) if by['adb'].ok else None}
+
+
+def ndk_shader_tool(ndk, name):
+    host = 'windows-x86_64' if os.name == 'nt' else 'darwin-x86_64' if sys.platform == 'darwin' else 'linux-x86_64'
+    return Path(ndk) / 'shader-tools' / host / (name + EXE)

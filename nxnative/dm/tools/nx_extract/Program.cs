@@ -15,6 +15,8 @@ using LibHac.Common.Keys;
 using LibHac.Fs;
 using LibHac.Fs.Fsa;
 using LibHac.FsSystem;
+using LibHac.Ncm;
+using LibHac.Tools.Ncm;
 using LibHac.Spl;
 using LibHac.Tools.Fs;
 using LibHac.Tools.FsSystem;
@@ -31,7 +33,7 @@ static class P {
         if (a.Length < 4) { Console.Error.WriteLine("usage: nx_extract <prod.keys> <base.nsp> <update.nsp|-> <out dir> [base RomFS dir] [--manifest] [--allow-damaged]\n       nx_extract <prod.keys> --aoc <dlc.nsp> <out dir>"); return 2; }
         KeySet ks = ExternalKeyReader.ReadKeyFile(a[0]);
         if (a[1] == "--aoc") return Aoc(ks, a[2], a[3]);
-        var basePkg = OpenNsp(ks, a[1]); var updPkg = a[2] == "-" ? null : OpenNsp(ks, a[2]);
+        var basePkg = OpenNsp(ks, a[1], ContentMetaType.Application); var updPkg = a[2] == "-" ? null : OpenNsp(ks, a[2], ContentMetaType.Patch);
         Nca baseProg = Pick(basePkg, NcaContentType.Program) ?? throw new Exception("no Program NCA in the base NSP");
         Nca updProg = updPkg == null ? null : Pick(updPkg, NcaContentType.Program, baseProg.Header.TitleId) ?? throw new Exception("no Program NCA of the base game's program in the update NSP");
         Nca ctrl = Pick(updPkg ?? basePkg, NcaContentType.Control, baseProg.Header.TitleId);
@@ -93,8 +95,23 @@ static class P {
         return 0;
     }
 
-    // Open an NSP (PFS0) or the secure partition of an XCI, import the common tickets, list all NCAs
-    static List<Nca> OpenNsp(KeySet ks, string path) {
+    // The content metas (*.cnmt in the Meta NCAs) of a package's NCAs
+    static IEnumerable<Cnmt> Metas(List<Nca> ncas) {
+        foreach (Nca n in ncas) {
+            if (n.Header.ContentType != NcaContentType.Meta) continue;
+            IFileSystem mfs = n.OpenFileSystem(NcaSectionType.Data, IntegrityCheckLevel.ErrorOnInvalid);
+            foreach (DirectoryEntryEx e in mfs.EnumerateEntries("*.cnmt", SearchOptions.Default)) {
+                using var f = new UniqueRef<IFile>();
+                mfs.OpenFile(ref f.Ref, e.FullPath.ToU8Span(), OpenMode.Read).ThrowIfFailure();
+                yield return new Cnmt(f.Release().AsStream());
+            }
+        }
+    }
+
+    // Open an NSP (PFS0) or the secure partition of an XCI, import the common tickets, list all NCAs. With a content meta type, only the NCAs that the package's content metas of
+    // that type list (when it has one), and with a title ID only that title's: a cartridge dump with its update on it (1G+1U) or a merged NSP holds the update's NCAs beside the
+    // base game's, its Program NCA under the same title ID; a cartridge with two games holds two Application content metas
+    static List<Nca> OpenNsp(KeySet ks, string path, ContentMetaType? only = null, ulong? id = null) {
         IFileSystem pfs; var st0 = new LocalStorage(path, FileAccess.Read);
         byte[] magic = new byte[4]; st0.Read(0x100, magic).ThrowIfFailure();
         if (System.Text.Encoding.ASCII.GetString(magic) == "HEAD") {   // XCI: the card header's magic at 0x100
@@ -104,7 +121,7 @@ static class P {
         } else {
             var p = new PartitionFileSystem(); p.Initialize(st0).ThrowIfFailure(); pfs = p;
         }
-        var ncas = new List<Nca>();
+        var ncas = new List<Nca>(); var ids = new List<string>();   // ids: content IDs (the file names' hex)
         foreach (DirectoryEntryEx e in pfs.EnumerateEntries("*", SearchOptions.Default)) {
             using var f = new UniqueRef<IFile>();
             pfs.OpenFile(ref f.Ref, e.FullPath.ToU8Span(), OpenMode.Read).ThrowIfFailure();
@@ -113,9 +130,26 @@ static class P {
                 byte[] t = new byte[0x2c0]; st.Read(0, t).ThrowIfFailure();
                 if (t[0x281] != 0) { Console.Error.WriteLine($"[RED] {e.Name} is not a common ticket; supply the title key separately"); continue; }
                 ks.ExternalKeySet.Add(new RightsId(t.AsSpan(0x2a0, 0x10)), new AccessKey(t.AsSpan(0x180, 0x10))).ThrowIfFailure();
-            } else if (e.Name.EndsWith(".nca", StringComparison.OrdinalIgnoreCase)) ncas.Add(new Nca(ks, st));
+            } else if (e.Name.EndsWith(".nca", StringComparison.OrdinalIgnoreCase)) { ncas.Add(new Nca(ks, st)); ids.Add(e.Name[..e.Name.IndexOf('.')].ToLowerInvariant()); }
         }
-        return ncas;
+        if (only == null) return ncas;
+        var listed = new HashSet<string>(); var titles = new List<ulong>();   // titles: every content meta of that type, to name them when none is the one asked for
+        foreach (Cnmt cnmt in Metas(ncas)) {
+            if (cnmt.Type != only) continue;
+            titles.Add(cnmt.TitleId);
+            if (id == null || cnmt.TitleId == id) foreach (CnmtContentEntry c in cnmt.ContentEntries) listed.Add(Convert.ToHexString(c.NcaId).ToLowerInvariant());
+        }
+        if (id != null && titles.Count > 0 && !titles.Contains(id.Value))
+            throw new Exception($"{Path.GetFileName(path)} has no {only} content meta of title {id:x16}; it has {string.Join(", ", titles.ConvertAll(t => t.ToString("x16")))}");
+        if (listed.Count == 0) return ncas;
+        var kept = new List<Nca>(); int other = 0;   // the meta NCAs list the others, not themselves
+        for (int i = 0; i < ncas.Count; i++) if (listed.Contains(ids[i])) kept.Add(ncas[i]); else if (ncas[i].Header.ContentType != NcaContentType.Meta) other++;
+        if (!kept.Exists(n => n.Header.ContentType == NcaContentType.Program)) {   // file names that are not content IDs (renamed NCAs): nothing matches, so read every NCA as before
+            Console.WriteLine($"[RED] no NCA of {Path.GetFileName(path)} matches its {only} content meta by name (renamed NCA files?); reading all {ncas.Count}");
+            return ncas;
+        }
+        if (other > 0) Console.WriteLine($"leaving out {other} NCAs of {Path.GetFileName(path)} that its {only} content meta does not list (another title in the package: an update on the cartridge, or a merged NSP)");
+        return kept;
     }
     // A multi-program application has a Program and a Control NCA per program index (ROMANCE OF THE THREE KINGDOMS 8 REMAKE: its update 1.1.3 adds a whole second program,
     // title ID …0001, beside the game's patch, …0000): with no title ID the lowest one (program index 0, the game), else the NCA of that title ID

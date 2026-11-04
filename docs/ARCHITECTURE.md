@@ -47,6 +47,13 @@ A profile is offered for Android when it has an `android.tsv`; the profiles with
 
 Per-build knowledge stays where upstream keeps it: the rewriter's cuts in `patches.py` / `dm/tools/sdk_patches.py`, keyed by build ID.
 
+Runtime GLSLC shaders can be captured while porting on an Apple Silicon Mac. The pipeline
+rewrites a separate Apple-target copy of the modules, boots the silent, headless Mac host,
+and checks the capture against the profile before splitting shaders. Other hosts can reuse
+a complete capture beside the extraction; without one they stop with an explanation.
+Merged NSP/XCI packages that contain both application and patch metadata are used for
+both extraction roles, with NCAs selected by the corresponding content metadata.
+
 ## The port
 
 `python -m porter port <game folder> -k <prod.keys>` (the GUI's **Port** button) runs these stages. The slow ones (extraction, rewrite, shader split, the translator build, the Vulkan shaders) keep their output with a key of their inputs and are skipped on the next run when the key is unchanged; the host build is incremental (`build.py`), and the APK and the data pack are made again each time (seconds).
@@ -66,6 +73,12 @@ Per-build knowledge stays where upstream keeps it: the rewriter's cuts in `patch
 
 RomFS in the data pack is hard-linked to the extraction when the volume allows it, so it takes no extra space.
 
+Subgroup instructions inside helper functions are inlined with the NDK's `spirv-opt`
+before shader reflection and packaging (`dm/android/tools/spirv_portable.py`). Adreno 750
+crashes while compiling an otherwise valid subgroup shuffle in a called function;
+a synthetic shader reproduces it. Ordinary helpers and subgroup operations already in
+entry points keep their original bytes. This changes no bindings or computation.
+
 ## Saves
 
 The app keeps the game's save in its internal storage (`$DM_SAVE`, and `<DM_SAVE>_device` for a game that mounts a device save too: `hle_fs.c`), which a reinstall keeps, an uninstall deletes, and adb cannot read in a release build (it is not debuggable). The save manager (`dm/android/saves_android.c`) copies it in and out through the app's files folder, which adb, porter and the PC reach without a permission:
@@ -80,7 +93,7 @@ Shaders captured on the device: a game can set shaders whose code is in no game 
 
 The install starts the app once before pushing anything: Android makes the app's files folder, owned by the app with the app's group, when the app first asks for it, and a folder the shell makes first lacks that group underneath FUSE, so the app cannot read what is pushed below it. Files whose path passes Windows' 260 characters are pushed through short hard links (adb.exe is not long-path aware). A file already on the device at its size is skipped; the port's own outputs (everything but `RomFS/` and `aoc/`, which change only with the game's version) are also compared by MD5, because a rewriter cut changes a module without changing its size.
 
-What the port refuses: a game whose `main` renders with Vulkan or OpenGL (the Android host replays NVN only so far), and one whose shaders need a step upstream runs by booting the game in the Mac host (GLSLC capture, Unreal / Oodle decoding).
+What the port refuses: a game whose `main` renders with Vulkan or OpenGL (the Android host replays NVN only so far), and one whose shaders need an unavailable Mac-host decoding step (Unreal / Oodle). Runtime GLSLC capture is supported on Apple Silicon, or reused when already complete.
 
 **Versions.** The newest version in the folder is packed. A version the profile was not brought up on is packed from a derived profile (upstream's `derive_profile`, in `profile-derived/`), without that version's per-build fixes. When another build is packed (GitHub issue #26):
 - a profile that declares virtual address memory (a `sys_resource` row, not 0) gets 8 GB more `mem_alias` and `mem_reserve` in its derived copy (`pipeline.alias_headroom`): the address regions such a game reserves depend on its build (Donkey Kong Country Returns HD's base game reached +7.0 GB of alias region, where its tested update stays under +2.75 GB), the tested build's high-water mark does not bind another one, and the heap and the device's memory stay as they are;
