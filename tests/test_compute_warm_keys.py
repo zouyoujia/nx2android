@@ -155,9 +155,9 @@ static inline __attribute__((unused)) void vk_gpu_segment_end(uint32_t token,uin
 #define PT_DISPATCH 0xffffffffu
 enum {RK_SBUF=4,RK_TEX=7,RK_TBUF=8,RK_IMG=9,RK_IMG_TBUF=10,RK_TEX_C2A=11,RK_TEX_UBO=12,RK_TBUF_UBO=13,RK_IMG_UBO=14};
 typedef struct {uint8_t kind;uint16_t binding;} dmsv_bind;
-typedef struct {uint64_t key;int stage,nbind,ndyn;const dmsv_bind *b;VkDescriptorSetLayout dsl;} vkshader_t;
+typedef struct {uint64_t key;int stage,nbind,ndyn;const dmsv_bind *b;VkDescriptorSetLayout dsl;uint32_t local[3];} vkshader_t;
 static dmsv_bind bindings[3]={{RK_TEX,0},{RK_TEX,1},{RK_SBUF,2}};
-static vkshader_t shader={11,5,3,0,bindings,(VkDescriptorSetLayout)(uintptr_t)1};
+static vkshader_t shader={11,5,3,0,bindings,(VkDescriptorSetLayout)(uintptr_t)1,{1,1,1}};
 static struct {VkDevice dev;VkPipelineCache pcache;} V;
 static struct {vkshader_t *sh[6];struct {uint64_t addr,size;} ssbo[6][16];} S;
 static struct {uint64_t dispatches;} g_vkst;
@@ -184,6 +184,7 @@ static vkshader_t *vk_shader(uint64_t key,int stage){assert(key==11 && stage==5)
 int vk_shader_keys(uint32_t stage,uint64_t *out,int max){assert(stage==5 && max>=1);out[0]=11;return 1;}
 static int build_begin(void){return -1;}
 static void build_end(int slot){assert(slot==-1);}
+static const void *vk_sg_pin(VkShaderStageFlagBits stage,const uint32_t *local){assert(stage==VK_SHADER_STAGE_COMPUTE_BIT && local==shader.local);return NULL;}
 static VkShaderModule vk_shader_module(vkshader_t *cs,uint64_t um,uint64_t im,uint32_t xo,int fd){assert(cs==&shader && !xo && !fd);last_um=um;last_im=im;return (VkShaderModule)(uintptr_t)3;}
 static VkPipelineLayout vk_pipeline_layout(VkDescriptorSetLayout *sets,int n){assert(n==1 && sets[0]==shader.dsl);return (VkPipelineLayout)(uintptr_t)4;}
 static VkResult vkCreateComputePipelines(VkDevice dev,VkPipelineCache cache,uint32_t n,const VkComputePipelineCreateInfo *ci,const VkAllocationCallbacks *callbacks,VkPipeline *out){

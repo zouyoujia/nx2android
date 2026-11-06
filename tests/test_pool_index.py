@@ -15,7 +15,7 @@ class PoolIndex(unittest.TestCase):
 #include <stdio.h>
 #include <string.h>
 #include <pthread.h>
-#define MAXPOOL 4096
+#define MAXPOOL 32768
 #define LOG(...) do {if(0)fprintf(stderr,__VA_ARGS__);}while(0)
 static void die(const char *fmt,int n){(void)fmt;(void)n;abort();}
 typedef struct {uint64_t lo,hi,end;} vkpool_t;

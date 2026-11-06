@@ -24,13 +24,13 @@ class TextureCopyPrepare(unittest.TestCase):
 #include "texture_copy_batch.h"
 #define VKLOG(...) do {if(0)fprintf(stderr,__VA_ARGS__);}while(0)
 #define VKRED_ONCE(n,...) do {(void)(n);if(0)fprintf(stderr,__VA_ARGS__);}while(0)
-typedef struct {int depth,stencil;unsigned bw,bh,bpb,dbpp;int dec;} vkfmt_t;
-typedef struct {VkImageLayout layout;VkImage img;uint64_t pool,used,pkg_used,pkg_stamp,pkg_seen,pkg_hash;int64_t off,size;int flags,packaged,pkg_released,gpu_w;const void *pkg_span;unsigned layers,d,aspect;} vkimg_t;
+typedef struct {int depth,stencil,compressed;unsigned bw,bh,bpb,dbpp;int dec;} vkfmt_t;
+typedef struct {VkImageLayout layout;VkImage img;uint64_t pool,used,pkg_used,pkg_stamp,pkg_seen,pkg_hash;int64_t off,size;int flags,packaged,pkg_released,gpu_w,nvn_format,looked;VkImageUsageFlags usage;const void *pkg_span;unsigned layers,d,aspect;} vkimg_t;
 typedef struct {uint64_t pool;int64_t off;nvn_texdesc d;} akey;
 typedef struct {uint64_t hi;} vkpool_t;
 static pthread_mutex_t g_img_mu=PTHREAD_MUTEX_INITIALIZER;
 static int g_by_key,g_by_serial,exists,sub_open=1,package,cpu_written,linear,source_ok=1;
-static int up_calls,up_prepares,main_prepares,copies,readbacks,package_calls,linear_calls;
+static int up_calls,up_prepares,main_prepares,copies,readbacks,package_calls,linear_calls,clears,clear_barriers,unknown_readbacks;
 static uint64_t g_tex_frame=3,g_img_n,g_img_bytes,g_copy_dst_preparations;
 int g_prof_on;uint64_t g_prof_ns[8];
 static vkimg_t image;static vkfmt_t format={.bw=1,.bh=1,.bpb=4,.dbpp=4};
@@ -40,21 +40,26 @@ static vkimg_t *vk_tex_(const tex_t *,int);
 static VkCommandBuffer vk_upload_cmd(void){up_calls++;return (VkCommandBuffer)(uintptr_t)9;}
 static VkCommandBuffer vk_cmd(void){return (VkCommandBuffer)(uintptr_t)7;}
 static void vkCmdPipelineBarrier(VkCommandBuffer cb,VkPipelineStageFlags src,VkPipelineStageFlags dst,VkDependencyFlags dep,uint32_t nm,const VkMemoryBarrier *m,uint32_t nb,const VkBufferMemoryBarrier *b,uint32_t ni,const VkImageMemoryBarrier *i){
+ if(nm){assert(cb && m && nm==1 && !nb && !ni && !b && !i && !dep);assert(src==VK_PIPELINE_STAGE_TRANSFER_BIT && dst==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);assert(m->srcAccessMask==VK_ACCESS_TRANSFER_WRITE_BIT);clear_barriers++;return;}
  (void)m;(void)b;assert(!dep && !nm && !nb && ni==1 && i && src==VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT && dst==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
  assert(i->oldLayout==VK_IMAGE_LAYOUT_UNDEFINED && i->newLayout==VK_IMAGE_LAYOUT_GENERAL && i->image==image.img);
  assert(!i->srcAccessMask && i->dstAccessMask==(VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT));
  if(cb==(VkCommandBuffer)(uintptr_t)9)up_prepares++;else{assert(cb==(VkCommandBuffer)(uintptr_t)7);main_prepares++;}
 }
+static void vkCmdClearColorImage(VkCommandBuffer cb,VkImage im,VkImageLayout layout,const VkClearColorValue *z,uint32_t n,const VkImageSubresourceRange *r){assert(cb && im==image.img && layout==VK_IMAGE_LAYOUT_GENERAL && n==1 && r && !z->uint32[0] && !z->uint32[1] && !z->uint32[2] && !z->uint32[3]);clears++;}
+static void vkCmdClearDepthStencilImage(VkCommandBuffer cb,VkImage im,VkImageLayout layout,const VkClearDepthStencilValue *z,uint32_t n,const VkImageSubresourceRange *r){(void)cb;(void)im;(void)layout;(void)z;(void)n;(void)r;abort();}
 static void vk_tex_prepare(VkCommandBuffer cb,vkimg_t *im);
 static const vkfmt_t *vk_fmt(int f){return f==1?&format:NULL;}
 static void *nvn_hm_get(void *map,const void *key){(void)key;assert(map==&g_by_key || map==&g_by_serial);return exists?&image:NULL;}
 static void nvn_hm_put(void *map,const void *key,void *v){(void)map;(void)key;assert(v==&image);exists=1;}
 static void evict_overlaps(uint64_t p,int64_t o,int64_t n){(void)p;(void)o;(void)n;}
-static vkimg_t *img_new(const tex_t *t,const vkfmt_t *f){(void)f;memset(&image,0,sizeof image);image.img=(VkImage)(uintptr_t)10;image.layers=1;image.aspect=VK_IMAGE_ASPECT_COLOR_BIT;image.d=t->d.depth;return &image;}
+static vkimg_t *img_new(const tex_t *t,const vkfmt_t *f){(void)f;memset(&image,0,sizeof image);image.img=(VkImage)(uintptr_t)10;image.layers=1;image.aspect=VK_IMAGE_ASPECT_COLOR_BIT;image.d=t->d.depth;image.nvn_format=t->d.format;image.usage=VK_IMAGE_USAGE_TRANSFER_DST_BIT;return &image;}
 static void alias_link(vkimg_t *im){assert(im==&image);}
 static void pool_image_add(vkimg_t *im,const akey *k){assert(im==&image && k->pool==im->pool);}
 static int vk_sub_open(void){return sub_open;}
 static int lin_copy(vkimg_t *im,const tex_t *t,const vkfmt_t *f){(void)t;(void)f;if(!linear)return 0;linear_calls++;vk_tex_prepare(vk_upload_cmd(),im);return 1;}
+static int cpu_content_tex(const tex_t *t,const vkfmt_t *f){(void)t;(void)f;return 0;}
+static void vk_readback_unknown(void){unknown_readbacks++;}
 static int packaged_tex(const tex_t *t){(void)t;return package;}
 int nvn_ft_written(const tex_t *t){(void)t;return cpu_written;}
 static void pkg_upload(vkimg_t *im,const tex_t *t,const vkfmt_t *f){(void)t;(void)f;package_calls++;vk_tex_prepare(vk_upload_cmd(),im);}
@@ -77,13 +82,13 @@ void vk_gpu_wrote(uint64_t a,uint64_t n){assert(a==0x10000 && n==4096);}
 static vkpool_t pool={.hi=0x11000};
 static vkpool_t *vk_pool_of(uint64_t a,uint64_t n){(void)a;(void)n;return &pool;}
 '''+funcs+r'''
-static void reset(void){exists=package=cpu_written=linear=up_calls=up_prepares=main_prepares=copies=readbacks=package_calls=linear_calls=0;g_copy_dst_preparations=0;sub_open=source_ok=1;}
+static void reset(void){clears=clear_barriers=unknown_readbacks=0;exists=package=cpu_written=linear=up_calls=up_prepares=main_prepares=copies=readbacks=package_calls=linear_calls=0;g_copy_dst_preparations=0;sub_open=source_ok=1;}
 int main(void){
  tex_t t={0};t.magic=MAGIC('T','E','X',0);t.serial=1;t.mem=(void *)(uintptr_t)0x20000;t.pool=(void *)(uintptr_t)0x30000;t.L.size=4096;t.d.format=1;t.d.target=NVN_TEXTURE_TARGET_2D;t.d.width=t.d.height=8;t.d.depth=1;
  p_copy_b2t c={.src=0x10000,.tex=&t,.r={.width=8,.height=8,.depth=1}};
- reset();copy_b2t(&c,1);assert(copies==1 && main_prepares==1 && !up_calls && image.gpu_w && g_copy_dst_preparations==1);
+ reset();copy_b2t(&c,1);assert(copies==1 && main_prepares==1 && !up_calls && image.gpu_w && g_copy_dst_preparations==1 && clears==1 && clear_barriers==1);
  copy_b2t(&c,1);assert(copies==2 && main_prepares==1 && !up_calls && g_copy_dst_preparations==1);
- reset();copy_b2t(&c,0);assert(readbacks==1 && up_calls==1 && up_prepares==1 && !main_prepares && !g_copy_dst_preparations);
+ reset();copy_b2t(&c,0);assert(readbacks==1 && up_calls==1 && up_prepares==1 && !main_prepares && !g_copy_dst_preparations && unknown_readbacks==1);
  reset();package=1;copy_b2t(&c,1);assert(copies==1 && package_calls==1 && up_calls==1 && !main_prepares && !g_copy_dst_preparations);
  reset();cpu_written=1;copy_b2t(&c,1);assert(copies==1 && package_calls==1 && up_calls==1 && !g_copy_dst_preparations);
  reset();linear=1;copy_b2t(&c,1);assert(copies==1 && linear_calls==1 && up_calls==1 && !g_copy_dst_preparations);

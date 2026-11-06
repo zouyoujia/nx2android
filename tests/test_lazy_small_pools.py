@@ -36,7 +36,7 @@ class LazySmallPools(unittest.TestCase):
         prefix = begin[begin.index('{') + 1:begin.index('    if (g_tsq)')]
         begin_test = 'static void tested_begin(void) {' + prefix + '\n    g_cur = -1; pthread_mutex_unlock(&g_sub_lock);\n}\n'
         names = ('lazy_small_pools', 'zc_over', 'zc_under', 'vk_mem_type',
-                 'staging_cache_defer', 'pool_allocate_copy', 'pool_add_one', 'pool_add_impl',
+                 'pool_copied_alloc', 'pool_allocate_backing', 'staging_cache_defer', 'pool_allocate_copy', 'pool_add_one', 'pool_add_impl',
                  'mtl_pool_add', 'mtl_pool_add_flags', 'pool_prepare_submission',
                  'mtl_pool_del', 'vk_pool_remap_ro', 'vk_pools_sync_')
         implementations = '\n'.join(function(source, name) for name in names)
@@ -84,6 +84,17 @@ static void log_line(const char *format,...){(void)format;}
 #define VKCHK(call) do { VkResult status=(call); assert(status==VK_SUCCESS); } while(0)
 static _Noreturn void die(const char *format,...){(void)format;abort();}
 static void vk_init(void){}
+static int mem_diag_on(void){return 0;}
+static uint64_t mem_diag_ns(void){return 0;}
+static void mem_diag_note(unsigned k,uint64_t t,uint64_t n){(void)k;(void)t;(void)n;}
+static void mem_diag_baselines(const uint64_t *a,const uint64_t *b){(void)a;(void)b;}
+static void mem_diag_pool(uint64_t s,uint32_t b,uint32_t t){(void)s;(void)b;(void)t;}
+static void pool_cache_sync(vkpool_t *p,int i,uint64_t a,uint64_t b){assert(!p->noncoherent);(void)i;(void)a;(void)b;}
+static PFN_vkFlushMappedMemoryRanges vkFlushMappedMemoryRanges;
+static PFN_vkInvalidateMappedMemoryRanges vkInvalidateMappedMemoryRanges;
+static void vkDestroyBuffer(VkDevice d,VkBuffer b,const void *a){(void)d;(void)b;(void)a;}
+static void vkFreeMemory(VkDevice d,VkDeviceMemory m,const void *a){(void)d;(void)m;(void)a;}
+
 static void pool_ord_add(void){}
 static void pool_ord_del(int i){(void)i;}
 static void pool_profile_report(void){}
@@ -126,7 +137,7 @@ static int nvn_dirty_since_span(const void *span,const void *address,size_t size
 }
 '''+implementations+r'''
 static int g_cur=-1,g_shadow_pools;static uint64_t g_fence=17,g_cmd_gen;
-typedef struct {int npost,up_used,ngw,nmain_used,cb_err,nup_used,nmain_sent;VkCommandBuffer main,up,mains[1],ups[1];} vksub_t;
+typedef struct {int npost,up_used,ngw,readback_ranges,nmain_used,cb_err,nup_used,nmain_sent;VkCommandBuffer main,up,mains[1],ups[1];} vksub_t;
 static vksub_t g_slot[NSLOT];
 static void slot_recycle(vksub_t *slot){assert(slot);}
 static VkResult vkBeginCommandBuffer(VkCommandBuffer buffer,const VkCommandBufferBeginInfo *info){assert(buffer && info);return VK_SUCCESS;}
@@ -163,6 +174,8 @@ int main(int argc,char **argv){
         mtl_pool_add_flags(guest_a,4096,2);assert(g_pool[0].lazy && !allocate_calls);
         assert(pool_prepare_submission());assert(allocate_calls==1 && !g_pool[0].synced);
         vk_pools_sync_(VK_NULL_HANDLE);uint8_t *saved=g_pool[0].shadow;
+        assert(g_pool[0].baseline && !memcmp(g_pool[0].baseline,guest_a,4096));
+        g_pool[0].noncoherent=1;assert(!staging_cache_defer(&g_pool[0]));g_pool[0].noncoherent=0;
         assert(!memcmp(saved,guest_a,4096));mtl_pool_del(guest_a);assert(!g_npool && wait_calls==1);
         mtl_pool_add_flags(guest_b,4096,2);assert(g_pool[0].lazy);
         assert(pool_prepare_submission());assert(allocate_calls==1 && g_pool[0].shadow==saved && !g_pool[0].synced && !g_pool[0].span);

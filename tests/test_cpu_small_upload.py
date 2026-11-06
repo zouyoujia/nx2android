@@ -1,5 +1,6 @@
 """Run the actual guarded upload and import-type selector against host mocks."""
 from pathlib import Path
+from tests.test_lazy_small_pools import function
 import os
 import shutil
 import subprocess
@@ -16,9 +17,8 @@ class CpuSmallUpload(unittest.TestCase):
         source = (DM / 'android/gfx_vk_core.c').read_text()
         upload = source[source.index('int mtl_cpu_upload(const uint64_t *handles, int n) {'):
                         source.index('\nint mtl_wait(uint64_t fence, uint64_t timeout_ns) {')]
-        mem_type = source[source.index('uint32_t vk_mem_type('):source.index('\nstatic int has_ext(')]
-        choose_type = source[source.index('static uint32_t cpu_small_upload_memory_type('):
-                             source.index('\n// Zero copy:')]
+        mem_type = function(source, 'vk_mem_type')
+        choose_type = function(source, 'cpu_small_upload_memory_type')
         code = r'''
 #include <assert.h>
 #include <stdint.h>

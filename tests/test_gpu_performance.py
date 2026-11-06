@@ -44,7 +44,7 @@ class GpuPerformancePackaging(unittest.TestCase):
                 with mock.patch.object(pipeline.nsp, "run", side_effect=build_host):
                     port.host()
                 self.assertEqual("--adrenotools" in host_commands[0], perf or custom)
-                port.icon = lambda: None; port.theme = lambda: []
+                port.icon = lambda: []; port.theme = lambda: []
                 with mock.patch.object(pipeline.paths, "signing_key", return_value=t / "signing.json"):
                     port.apk()
                 with zipfile.ZipFile(port.apk_path) as apk:

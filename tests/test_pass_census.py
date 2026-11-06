@@ -350,6 +350,9 @@ void vk_sub_update(uint64_t a,const void *p,uint64_t n){assert(a==2 && p && n==4
 void set_rt(const p_set_rt *p){assert(p);note('R');}
 void clear_color(const p_clear_color *p){assert(p);note('c');S.pass_open=2;P_cleared=1;}
 void clear_ds(const p_clear_ds *p){assert(p);note('z');S.pass_open=2;P_cleared=1;}
+static int g_pool_tex_base,g_pool_samp_base;
+static int nvn_dpool_base(const void *p,int t){(void)p;(void)t;return 0;}
+static void bind_chmask(uint32_t mask){S.chmask.mask=mask;}
 void bind_program(const p_bind_program *p){assert(p);note('p');}
 void bind_handles_rec(uint32_t op,const void *p){(void)op;assert(p);note('h');}
 void draw(const p_draw *p){assert(p);note('D');S.pass_open=1;g_pass_draws++;}
