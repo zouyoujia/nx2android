@@ -215,7 +215,7 @@ int main(void){
 #include <string.h>
 #include "nvn_obj.h"
 static uint64_t g_cmd_gen=7;
-static int g_x_nobc,g_tb_mode,g_bc_stale,binds;
+static int g_x_nobc,g_tb_mode,g_bc_stale,g_x_rebind_fast,binds;
 static void vkCmdBindIndexBuffer(VkCommandBuffer cb,VkBuffer b,VkDeviceSize o,VkIndexType t){
     assert(cb==(VkCommandBuffer)(uintptr_t)1 && b==(VkBuffer)(uintptr_t)2 && o==32 && t==VK_INDEX_TYPE_UINT16);binds++;
 }
@@ -234,6 +234,12 @@ int main(void){
     g_cmd_gen++;bind();assert(binds==4);
     g_bc_stale=1;bind();assert(binds==5 && !g_bc_stale);
     g_x_nobc=1;bind();bind();assert(binds==7);
+    g_x_rebind_fast=1;g_bc.vp.width=1920;bind();bind();assert(binds==9 && g_bc.vp.width==1920);
+    g_cmd_gen++;bind();assert(binds==10 && !g_bc.vp.width);
+    g_bc.vp.width=1920;g_bc_stale=1;bind();assert(binds==11 && !g_bc.vp.width);
+    g_x_nobc=0;g_tb_mode=2;bind();bind();assert(binds==13);
+    g_tb_mode=0;bind();assert(binds==13);
+
     return 0;
 }
 ''')

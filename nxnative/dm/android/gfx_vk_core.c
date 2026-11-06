@@ -12,6 +12,7 @@
 #include "cpu_small_upload.h"
 #include "pass_census.h"
 #include "gpu_segments.h"
+#include "staging_cache.h"
 #include "nvn_hmap.h"
 #include "nvn_dirty.h"
 #include <android/hardware_buffer.h>
@@ -328,14 +329,38 @@ static void pool_profile_report(void) {
     pthread_rwlock_unlock(&g_pool_mu);
     static uint64_t last; uint64_t step = (registered + retired) / 5000, before = __atomic_load_n(&last, __ATOMIC_RELAXED);
     if (step <= before || !__atomic_compare_exchange_n(&last, &before, step, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return;
+    if (staging_cache_enabled()) {
+        pthread_mutex_lock(&g_staging_cache.mu);
+        VKLOG("staging cache: hits %llu misses %llu returned %llu full %llu (8 slots; at most 1 MiB allocation memory)",
+            (unsigned long long)g_staging_cache.hits, (unsigned long long)g_staging_cache.misses,
+            (unsigned long long)g_staging_cache.returned, (unsigned long long)g_staging_cache.full);
+        pthread_mutex_unlock(&g_staging_cache.mu);
+    }
     VKLOG("pool profile: registered %llu, retired %llu, copied GPU allocations %llu, lazy registered %llu, materialized %llu, CPU-only retired %llu, lazy live %llu",
         (unsigned long long)registered, (unsigned long long)retired, (unsigned long long)copies,
         (unsigned long long)deferred, (unsigned long long)materialized, (unsigned long long)skipped,
         (unsigned long long)(deferred - materialized - skipped));
 }
 static uint16_t g_pool_ord[MAXPOOL];
-static int pool_ord_cmp(const void *a, const void *b) { uint64_t x = g_pool[*(const uint16_t *)a].lo, y = g_pool[*(const uint16_t *)b].lo; return x < y ? -1 : x > y; }
-static void pool_ord_make(void) { for (int i = 0; i < g_npool; i++) g_pool_ord[i] = (uint16_t)i; qsort(g_pool_ord, (size_t)g_npool, sizeof *g_pool_ord, pool_ord_cmp); }
+// Loading registered/retired 35,005/34,995 pools: rebuilding and sorting the
+// entire index at each operation was unnecessary. Both helpers hold g_pool_mu.
+static void pool_ord_add(void) {
+    int index = g_npool - 1, lo = 0, hi = index; uint64_t addr = g_pool[index].lo;
+    while (lo < hi) { int m = (lo + hi) / 2; if (g_pool[g_pool_ord[m]].lo <= addr) lo = m + 1; else hi = m; }
+    memmove(g_pool_ord + lo + 1, g_pool_ord + lo, (size_t)(index - lo) * sizeof *g_pool_ord); g_pool_ord[lo] = (uint16_t)index;
+}
+// The dense pool array already replaced removed with its former last element.
+// Remap that element's index, retaining its address-sorted position, and close
+// the deleted entry's gap. Equal-address pools retain their relative ordering.
+static void pool_ord_del(int removed) {
+    int at = -1;
+    for (int j = 0; j <= g_npool; j++) {
+        if (g_pool_ord[j] == removed) at = j;
+        if (g_pool_ord[j] == g_npool) g_pool_ord[j] = (uint16_t)removed;
+    }
+    if (at < 0) die("[vk] pool index removal missing %d", removed);
+    memmove(g_pool_ord + at, g_pool_ord + at + 1, (size_t)(g_npool - at) * sizeof *g_pool_ord);
+}
 static int recv_fds(int sock, int *fds, int max) {
     char data[4096], ctl[CMSG_SPACE(sizeof(int) * 16)]; struct iovec iov = {data, sizeof data};
     struct msghdr m = {0}; m.msg_iov = &iov; m.msg_iovlen = 1; m.msg_control = ctl; m.msg_controllen = sizeof ctl;
@@ -422,17 +447,30 @@ static int zc_over(uint64_t size) { static uint64_t m = 1; if (m == 1) { const c
 static int zc_under(uint64_t size) { static uint64_t m = 1; if (m == 1) { const char *e = getenv("DM_VK_ZEROCOPY_MIN_KB"); m = e && atoi(e) > 0 ? (uint64_t)atoi(e) << 10 : 0; } return m && size < m; }
 // g_pool_mu is held for writing. Every real submission materializes live lazy pools
 // before recording; the first normal pools_sync still takes a complete snapshot.
+static void df_add(int kind, void *a, void *b);
+static void staging_cache_retire(staging_entry *e);
+static int staging_cache_defer(const vkpool_t *p) {
+    if (!staging_cache_enabled() || p->zero_copy || p->ahb || p->flags < 0 || !(p->flags & 0x2) || (p->flags & (NVN_MEMORY_POOL_FLAGS_VIRTUAL | NVN_MEMORY_POOL_FLAGS_PHYSICAL)) || p->lazy) return 0;
+    staging_entry e = {p->buf, p->mem, p->shadow, p->hi - p->lo, p->copy_allocation_size};
+    if (!staging_cache_eligible(&e)) return 0;
+    staging_entry *saved = malloc(sizeof *saved); if (!saved) return 0;
+    *saved = e; df_add(5, saved, NULL); return 1;
+}
 static void pool_allocate_copy(vkpool_t *p) {
-    uint64_t size = p->hi - p->lo;
+    uint64_t size = p->hi - p->lo; staging_entry cached;
+    int reused = p->flags >= 0 && (p->flags & 0x2) && !(p->flags & (NVN_MEMORY_POOL_FLAGS_VIRTUAL | NVN_MEMORY_POOL_FLAGS_PHYSICAL)) && staging_cache_take(size, &cached);
+    if (reused) { p->buf = cached.buf; p->mem = cached.mem; p->shadow = cached.map; p->copy_allocation_size = cached.allocated; }
+    else {
     VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, size, POOL_USAGE, VK_SHARING_MODE_EXCLUSIVE};
     VKCHK(vkCreateBuffer(V.dev, &bi, NULL, &p->buf));
     VkMemoryRequirements req; vkGetBufferMemoryRequirements(V.dev, p->buf, &req);
     VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size,
         vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0)};
     VKCHK(vkAllocateMemory(V.dev, &ai, NULL, &p->mem)); VKCHK(vkBindBufferMemory(V.dev, p->buf, p->mem, 0));
-    void *m; VKCHK(vkMapMemory(V.dev, p->mem, 0, VK_WHOLE_SIZE, 0, &m)); p->shadow = m;
+    void *m; VKCHK(vkMapMemory(V.dev, p->mem, 0, VK_WHOLE_SIZE, 0, &m)); p->shadow = m; p->copy_allocation_size = req.size;
+    }
     p->synced = 0; p->span = NULL; p->stamp = p->stamp0 = 0;
-    g_pool_stats.copy_allocations++; if (p->lazy) g_pool_stats.materialized++;
+    if (!reused) g_pool_stats.copy_allocations++; if (p->lazy) g_pool_stats.materialized++;
     p->lazy = 0;
 }
 static void pool_add_impl(const void *mem, uint64_t size, int flags, int known) {
@@ -463,7 +501,7 @@ static void pool_add_one(const void *mem, uint64_t size, uint64_t base, uint64_t
         if (zc == -6 && known && lazy_small_pools() && (flags & 0x2) && end - base < (64u << 10)) { p->lazy = 1; g_pool_stats.deferred++; }
         else pool_allocate_copy(p);
     }
-    g_npool++; g_pool_stats.registered++; pool_ord_make(); __atomic_fetch_add(&g_pool_gen, 1, __ATOMIC_RELEASE);
+    g_npool++; g_pool_stats.registered++; pool_ord_add(); __atomic_fetch_add(&g_pool_gen, 1, __ATOMIC_RELEASE);
     pthread_rwlock_unlock(&g_pool_mu);
     pool_profile_report();
     static uint64_t zc_bytes, cp_bytes; if (zc) cp_bytes += size; else zc_bytes += size;
@@ -482,10 +520,10 @@ void mtl_pool_del(const void *mem) {
         pthread_rwlock_wrlock(&g_pool_mu);
         int i = 0; while (i < g_npool && g_pool[i].base != (uint64_t)(uintptr_t)mem) i++;
         if (i == g_npool) { pthread_rwlock_unlock(&g_pool_mu); return; }
-        vkpool_t p = g_pool[i]; g_pool[i] = g_pool[--g_npool]; g_pool_stats.retired++; if (p.lazy) g_pool_stats.cpu_only_retired++; pool_ord_make(); __atomic_fetch_add(&g_pool_gen, 1, __ATOMIC_RELEASE);
+        vkpool_t p = g_pool[i]; g_pool[i] = g_pool[--g_npool]; g_pool_stats.retired++; if (p.lazy) g_pool_stats.cpu_only_retired++; pool_ord_del(i); __atomic_fetch_add(&g_pool_gen, 1, __ATOMIC_RELEASE);
         pthread_rwlock_unlock(&g_pool_mu);
         if (p.zero_copy) pool_copy_back(&p);
-        if (p.buf || p.mem) vk_defer_free_buffer(p.buf, p.mem);   // metadata-only pools need no GPU fence or driver release
+        if ((p.buf || p.mem) && !staging_cache_defer(&p)) vk_defer_free_buffer(p.buf, p.mem);   // metadata-only pools need no GPU fence or driver release
         if (p.ahb) AHardwareBuffer_release(p.ahb);
         pool_profile_report();
     }
@@ -626,8 +664,14 @@ uint32_t vk_gpu_segment_begin(uint32_t kind, uint64_t tag, uint32_t w, uint32_t 
 void vk_gpu_segment_end(uint32_t token, uint32_t count) {
     if (token && g_gs_active && g_cur >= 0) gpu_segment_stamp(vk_gs_end(&g_gs_slot[g_cur], token, count));
 }
-static void gpu_segment_part_begin(void) { if (g_gs_active) gpu_segment_stamp(vk_gs_part_begin(&g_gs_slot[g_cur])); }
-static void gpu_segment_part_end(void) { if (g_gs_active) gpu_segment_stamp(vk_gs_part_end(&g_gs_slot[g_cur])); }
+static void gpu_segment_cpu(int phase) {
+    if (!g_gs_active || g_cur < 0) return;
+    vk_gs_state *s = &g_gs_slot[g_cur]; if (!s->np || s->np > VK_GS_PARTS) return;
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    s->cpu[s->np - 1][phase] = (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec;
+}
+static void gpu_segment_part_begin(void) { if (g_gs_active) { gpu_segment_stamp(vk_gs_part_begin(&g_gs_slot[g_cur])); gpu_segment_cpu(0); } }
+static void gpu_segment_part_end(void) { if (g_gs_active) { gpu_segment_cpu(1); gpu_segment_stamp(vk_gs_part_end(&g_gs_slot[g_cur])); } }
 static void gpu_segment_sub_begin(void) {
     g_gs_active = 0; if (!g_gsq) return;
     uint64_t frame = __atomic_load_n(&g_cur_frame, __ATOMIC_RELAXED);
@@ -686,6 +730,12 @@ static void gpu_segment_report(gpu_capture *c, uint64_t frame, uint64_t fence) {
                 (unsigned long long)c->query[begin].ticks, (unsigned long long)c->query[end].ticks, dt * ms);
         }
         fflush(out);
+    }
+    for (uint32_t i = 0; i < s->np; i++) {
+        const uint64_t *v = s->cpu[i];
+        VKLOG("CPU part: frame %llu fence %llu part %u monotonic_ns %llu/%llu/%llu/%llu/%llu (begin/record_end/end_cb/submit_begin/submit_end)",
+            (unsigned long long)frame, (unsigned long long)fence, i, (unsigned long long)v[0], (unsigned long long)v[1],
+            (unsigned long long)v[2], (unsigned long long)v[3], (unsigned long long)v[4]);
     }
     free(c);
 }
@@ -836,6 +886,7 @@ static void slot_recycle(vksub_t *s) {   // the GPU has passed this slot's last 
         else if (d->kind == 4) { void img_sub_free_(void *); vkDestroyImage(V.dev, (VkImage)d->a, NULL); img_sub_free_(d->b); }
         else if (d->kind == 2) vkDestroyImageView(V.dev, (VkImageView)d->a, NULL);
         else if (d->kind == 3) vkDestroyBufferView(V.dev, (VkBufferView)d->a, NULL);
+        else if (d->kind == 5) staging_cache_retire(d->a);
     }
     s->ndf = 0;
     for (int i = 0; i < s->nblk; i++) s->blk[i].used = 0;
@@ -856,6 +907,7 @@ static void vk_cmd_split_(void) {
     vksub_t *s = cur(); if (s->nmain_used == MAIN_CBS || s->nup_used == MAIN_CBS) return;
     gpu_segment_part_end();
     if (vkEndCommandBuffer(s->main) < 0) { s->cb_err = 1; static int n; if (n++ < 3) VKLOG("[RED] a part of a long submission was refused at its end (part %d)", s->nmain_used); }
+    gpu_segment_cpu(2);
     // what is recorded so far goes to the GPU now, as a submission of its own (with its uploads first): Adreno refuses a single submission past about
     // 700 draws (NEO's handheld frames: VK_ERROR_OUT_OF_HOST_MEMORY at vkEndCommandBuffer whatever the draws were, and in one command buffer or several)
     const char *se = getenv("DM_VK_SUBMIT_SPLIT"); int send = !(se && !atoi(se));   // on unless DM_VK_SUBMIT_SPLIT=0
@@ -865,7 +917,7 @@ static void vk_cmd_split_(void) {
         cbs[n++] = s->main;
         if (!s->cb_err) {
             VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, n, cbs, 0, NULL};
-            pthread_mutex_lock(&g_vk_queue_mu); vk_queue_changed(); VkResult r = vkQueueSubmit(V.q, 1, &si, VK_NULL_HANDLE); pthread_mutex_unlock(&g_vk_queue_mu);
+            gpu_segment_cpu(3); pthread_mutex_lock(&g_vk_queue_mu); vk_queue_changed(); VkResult r = vkQueueSubmit(V.q, 1, &si, VK_NULL_HANDLE); pthread_mutex_unlock(&g_vk_queue_mu); gpu_segment_cpu(4);
             if (r) { void vk_crumbs_report(void); vk_crumbs_report(); die("[vk] vkQueueSubmit (part): %d (device lost?)", r); }
             { static int n; if (n++ < 3) VKLOG("a long submission: part %d sent early", s->nmain_used); }
             s->nmain_sent = s->nmain_used;
@@ -908,10 +960,15 @@ void *vk_scratch(VkDeviceSize n, VkDeviceSize align, VkBuffer *buf, VkDeviceSize
     void *m; VKCHK(vkMapMemory(V.dev, b->m, 0, VK_WHOLE_SIZE, 0, &m)); b->p = m;
     b->used = n; *buf = b->b; *off = 0; return b->p;
 }
+static void staging_cache_retire(staging_entry *e) {
+    if (!staging_cache_return(e)) { vkDestroyBuffer(V.dev, e->buf, NULL); vkFreeMemory(V.dev, e->mem, NULL); }
+    free(e);
+}
 static void df_add(int kind, void *a, void *b) {
     if (g_cur < 0) {   // outside a submission (a pool finalized between frames): after everything submitted so far
-        wait_fence(g_fence);
-        if (kind == 0) { vkDestroyBuffer(V.dev, (VkBuffer)a, NULL); if (b) vkFreeMemory(V.dev, (VkDeviceMemory)b, NULL); }
+        if (kind == 5) completion_wait(g_fence, ~0ull, 1); else wait_fence(g_fence);
+        if (kind == 5) staging_cache_retire(a);
+        else if (kind == 0) { vkDestroyBuffer(V.dev, (VkBuffer)a, NULL); if (b) vkFreeMemory(V.dev, (VkDeviceMemory)b, NULL); }
         else if (kind == 1) { vkDestroyImage(V.dev, (VkImage)a, NULL); if (b) vkFreeMemory(V.dev, (VkDeviceMemory)b, NULL); }
         else if (kind == 4) { void img_sub_free_(void *); vkDestroyImage(V.dev, (VkImage)a, NULL); img_sub_free_(b); }
         else if (kind == 2) vkDestroyImageView(V.dev, (VkImageView)a, NULL);
@@ -1174,7 +1231,7 @@ int vk_ubd_shadow(uint64_t a, uint64_t n, VkBuffer *buf, VkDeviceSize *off) {
     c[k].a = a; c[k].n = n; c[k].gen = g_ubd_gen; c[k].b = *buf; c[k].o = *off; g_ubd_shadows++;
     return 1;
 }
-void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }
+// mtl_sub_index lives with command replay (gfx_vk_exec.c).
 void mtl_exec_rest(const uint64_t *h, int n) { (void)h; (void)n; }
 
 // completion: a queue of committed submissions, each with its CPU-visible effects
@@ -1270,7 +1327,7 @@ uint64_t mtl_sub_commit(void) {
     vk_end_pass_land_reason(VK_PASS_END_SUBMIT_END);
     if (g_tsq) vkCmdWriteTimestamp(s->main, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_tsq, 2 * (uint32_t)g_cur + 1);
     gpu_segment_part_end();
-    VkResult er = vkEndCommandBuffer(s->main); if (s->cb_err && er >= 0) er = VK_ERROR_OUT_OF_HOST_MEMORY;
+    VkResult er = vkEndCommandBuffer(s->main); gpu_segment_cpu(2); if (s->cb_err && er >= 0) er = VK_ERROR_OUT_OF_HOST_MEMORY;
     if (er < 0) {   // the driver refused something recorded in it: logged with what the submission held, then it is dropped and the game goes on
         extern uint32_t g_sub_ops[64]; char ops[600]; int o = 0;
         for (int i = 0; i < 64 && o < (int)sizeof ops - 16; i++) if (g_sub_ops[i]) o += snprintf(ops + o, sizeof ops - (size_t)o, " %d:%u", i, g_sub_ops[i]);
@@ -1298,9 +1355,9 @@ uint64_t mtl_sub_commit(void) {
         if (f > NFRING) mtl_wait(f - NFRING, ~0ull);
         fe = g_fring[f % NFRING]; VKCHK(vkResetFences(V.dev, 1, &fe)); si.pNext = NULL; si.signalSemaphoreCount = 0;
     }
-    struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0); uint64_t measure = sync_clock(); pthread_mutex_lock(&g_vk_queue_mu); sync_add(SP_LOCK, measure); measure = sync_clock(); vk_queue_changed(); VkResult r = vkQueueSubmit(V.q, 1, &si, fe); sync_add(SP_SUBMIT, measure); pthread_mutex_unlock(&g_vk_queue_mu); clock_gettime(CLOCK_MONOTONIC, &t1); g_ns_submit += (uint64_t)((t1.tv_sec - t0.tv_sec) * 1000000000ll + (t1.tv_nsec - t0.tv_nsec));
+    gpu_segment_cpu(3); struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0); uint64_t measure = sync_clock(); pthread_mutex_lock(&g_vk_queue_mu); sync_add(SP_LOCK, measure); measure = sync_clock(); vk_queue_changed(); VkResult r = vkQueueSubmit(V.q, 1, &si, fe); sync_add(SP_SUBMIT, measure); pthread_mutex_unlock(&g_vk_queue_mu); clock_gettime(CLOCK_MONOTONIC, &t1); g_ns_submit += (uint64_t)((t1.tv_sec - t0.tv_sec) * 1000000000ll + (t1.tv_nsec - t0.tv_nsec));
     if (r) { void vk_crumbs_report(void); vk_crumbs_report(); die("[vk] vkQueueSubmit: %d (device lost?)", r); }
-    kgsl_perf_submitted();
+    gpu_segment_cpu(4); kgsl_perf_submitted();
     s->fence = f;
     cpend *c = calloc(1, sizeof *c); c->fence = f; c->frame = __atomic_load_n(&g_cur_frame, __ATOMIC_RELAXED); c->n = s->npost; c->rslot = g_cur; c->slot = s->no_ts ? -1 : g_cur; s->no_ts = 0;
     c->segments = gpu_segment_snapshot(er < 0);

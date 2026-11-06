@@ -10,6 +10,7 @@ typedef struct { uint32_t begin, end; } vk_gs_part;
 typedef struct {
     uint32_t nq, nr, np, active, part_open, dropped, nested, invalid, upload_barriers;
     vk_gs_record rec[VK_GS_RECORDS]; vk_gs_part part[VK_GS_PARTS];
+    uint64_t cpu[VK_GS_PARTS][5]; // monotonic CPU begin/record-end/end-CB/pre-submit/post-submit; separate clock domain
 } vk_gs_state;
 // A live request skips the current frame, then selects whole distinct frames at
 // least 30 presents apart. All submissions of a selected frame share the decision.

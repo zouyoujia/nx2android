@@ -380,3 +380,108 @@ The engine is our own fork since 2026-10-29: no subtree pull from upstream, and 
 1. `python -m porter port <folder> --experimental --install`: the survey, a provisional profile and a first try on the device. Bring it up from there with the upstream tools and `devtools/` (docs in `nxnative/docs/agents`): the profile moves to `dm/games/<title ID>/`, fixes go into the core as general rules.
 2. Add `android.tsv` with `status` and `tested`.
 3. `python -m porter port` on its folder, install, play. Raise `status` to `playable` when it is.
+
+`DM_VK_REBIND_FAST=1` is an opt-in CPU-only experiment: full-rebind mode still
+returns fresh at every binding site and emits all original Vulkan state commands,
+but clears the state cache only on command-buffer changes or explicit stale state.
+Sparse GPU segment captures also record five monotonic CPU timestamps per part
+(begin, recording end, command-buffer end, submit begin/end). CPU and GPU clocks
+are separate: compare intervals within each domain, never subtract their epochs.
+Zero/missing CPU stages are reported as missing, not inferred as no cost.
+
+PJD110 follow-up at unchanged image quality: a same-process rebind-fast
+control/on/control trial had CPU replay means 7.37/7.17/7.07 ms; the continuing
+control improvement prevents attributing a benefit. Two heavy fragment SPIR-V
+modules validated after offline optimization (~38% fewer static instructions),
+but replacement/control/replacement GPU spans were 25.58/25.28/25.22 ms. Both
+modules loaded; no stable device benefit was established. Neither experiment is
+enabled by default. These windows used another stationary outdoor-menu view.
+
+CPU part milestones also bound application queue lead: the final part's submit
+returned at least 1.63-3.79 ms before the previous part could have finished on the
+GPU, yet the next-part gap was 3.13-4.12 ms. The first GPU timestamp cannot precede
+the first submit call; comparing elapsed intervals within each clock domain gives
+this conservative bound without subtracting CPU/GPU epochs. This rules out late
+application submission for those sampled final boundaries, but does not separate
+upload work, GPU dependencies, timestamp perturbation or driver scheduling. It is
+not proof of recoverable idle time. A startup two-stage replay trial changed view
+and draw count, so its timings are not a valid effect estimate.
+
+`DM_VK_STAGING_CACHE=1` (startup, default off) reuses exact-size copied staging
+allocations below 64 KiB with known CPU_UNCACHED flags. Eight slots retain at most
+1 MiB of allocation memory; oversized requirements, imported/AHardwareBuffer,
+unknown/non-staging and metadata-only pools keep their original lifetime path.
+Retirement goes through the existing deferred-free slot. Outside a submission,
+the cache waits for full completion/post/reset retirement rather than only the
+hardware fence. No allocation enters the cache before that point. A reused pool
+gets a new serial and resets synchronized/dirty-span state, so the first submission
+copies its whole new guest range. Buffer/image copies and QueueFinish remain GPU
+operations with their original ordering. Loading before this trial still made
+2,676 copied staging allocations despite lazy pools. PJD110 observed seven new
+allocations and 2,669 reuses, with no cache overflow. The user requested retaining
+this measured resource reduction without requiring a startup-time gain; the DQB2
+profile now opts in. The cache does not defer or skip texture writes. Host tests
+cover retirement and full resynchronization; startup reached the normal menu.
+No loading-time improvement is claimed.
+
+The Vulkan pool address index now uses binary insertion on registration and
+remaps/removes one index on dense-array deletion, under the same pool write lock.
+No full index reconstruction/qsort is needed (35,005 registrations plus 34,995
+retirements in the loading workload). Equal-start entries retain relative order;
+range-overlap fallback and pool-generation invalidation remain unchanged. Host
+checks compare actual indexed lookups against a linear coverage oracle through
+capacity, duplicate/nested ranges and randomized dense removals.
+
+Standalone buffer-to-texture submissions may prepare a fresh ordinary destination
+in the main command buffer immediately before its copy, rather than recording a
+layout-only upload command buffer. Admission accepts exactly one direct upload,
+optional preceding copy-stride state and END; multiple handles/copies, calls,
+jumps, unknown/mixed GPU work or malformed records keep the original path. This
+restriction matters: a later packaged upload in a mixed batch executes in the
+upload command buffer before the main buffer. Packaged/CPU-written/linear
+preparation remains unchanged, as do image-to-buffer reads and every actual copy.
+`DM_VK_UPLOAD_PROF=1` reports executed transfers and new-image preparations moved
+to main every 256 transfers; recorded NVN API calls are not treated as executed
+GPU submissions. The decision to retain these changes uses work/resource removal
+and correctness checks, per user preference, without an FPS/loading-time gate.
+
+
+Texture images also have an intrusive per-pool index, protected by the existing
+image mutex. A keyed image and its normalized storage key/list links share one
+allocation; the storage hash still resolves identical descriptions to the same
+image. Serial-only and dummy images retain their allocation/lifetime path. Pool
+finalization looks up only that pool's images, with an immediate empty-pool exit;
+no full storage-table traversal or restart after each hash deletion remains.
+Overlap eviction and bidirectional alias discovery visit only the same pool.
+Half-open storage intersection, 60-present retention, the 64-eviction bound and
+8-neighbor alias bound remain; bounded selection now follows the pool list rather
+than unspecified global hash-slot order. Eviction and pool finalization share
+index removal, preserving dirty protection release, alias/view invalidation and
+deferred GPU image/memory retirement. No image copy or synchronization is skipped.
+`DM_VK_TEX_POOL_PROF=1` reports empty pool drops, retired images and actual same-pool
+visits. Sanitized host checks cover empty staging pools, unrelated pools, key/hash
+growth and shifts, pool address reuse, overlap/age boundaries and both retirement
+routes. The criterion for retention is removed work plus correctness, without an
+FPS/loading-time gate.
+
+PJD110 startup observed 34,816 pool drops with no indexed images: these now exit
+without visiting the storage table. At that checkpoint 2,837 images occupied one
+texture pool, so same-pool overlap/alias traversal remains necessary and the
+multi-pool filtering benefit is limited in this workload. The 116 host checks
+passed, including AddressSanitizer/UndefinedBehaviorSanitizer index lifecycle
+coverage. The release was installed under the original package and restarted with
+the diagnostic flag removed; save graphics confirmation remains pending.
+
+
+The DQB2 Android profile now sets `DM_ADAPTIVE_FPS=0` at user request, retaining
+the game's original interval and normal 60 Hz pacing. A restarted stock-driver
+1080p outdoor menu observed 30.00 -> 45.82 FPS over checkpoint intervals; typical
+frame medians were 33.30 -> 21.40 ms and GPU submission spans 29.91 -> 19.00 ms.
+The camera/companion placement differed slightly and draws increased from 1,257
+to 1,382, so this is not an exact-workload A/B or causal frequency attribution.
+Before/after rendering CPU replay was about 9.2-9.6 / 6.3-6.5 ms, which overlaps
+GPU execution and must not be added to it. A separate bounded trace reported
+about 76% app GPU activity in driver work periods; GPU MHz was not established
+(no frequency transitions captured and sysfs access denied). These findings do
+not establish maximum hardware performance; prior 30 ms spans were not fixed
+hardware costs. No driver, global power setting or game frame-rate patch changed.

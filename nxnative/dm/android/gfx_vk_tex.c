@@ -160,6 +160,34 @@ static VkImageViewType vtype_of(int target) {
 typedef struct { uint64_t pool; int64_t off; nvn_texdesc d; } akey;
 static nvn_hmap g_by_key = {.klen = sizeof(akey)};     // akey → vkimg_t*
 static nvn_hmap g_by_serial = {.klen = sizeof(uint64_t)};  // serial → vkimg_t* (images with no storage key: no pool memory)
+// Intrusive per-pool index under g_img_mu. The node and exact normalized key share
+// the image allocation: no separate per-image malloc and no hash-slot pointers
+// that could become stale when the storage table grows or shifts on deletion.
+typedef struct pool_image { vkimg_t im; akey key; struct pool_image *prev, *next; } pool_image;
+static nvn_hmap g_by_pool = {.klen = sizeof(uint64_t)};   // pool -> pool_image head; empty pools are absent
+static struct { uint64_t added, drop_calls, empty_drops, dropped, alias_visits, evict_visits; } g_tex_pool_stats;
+static void tex_pool_profile(void) {
+    static int enabled = -1; if (enabled < 0) { const char *e = getenv("DM_VK_TEX_POOL_PROF"); enabled = e && atoi(e); }
+    if (enabled) VKLOG("texture pool index: images added %llu, pool drops %llu (%llu empty), images dropped %llu; same-pool alias visits %llu, eviction visits %llu; live pools %u images %u",
+        (unsigned long long)g_tex_pool_stats.added, (unsigned long long)g_tex_pool_stats.drop_calls, (unsigned long long)g_tex_pool_stats.empty_drops,
+        (unsigned long long)g_tex_pool_stats.dropped, (unsigned long long)g_tex_pool_stats.alias_visits, (unsigned long long)g_tex_pool_stats.evict_visits, g_by_pool.n, g_by_key.n);
+}
+static void pool_image_add(vkimg_t *im, const akey *key) {
+    pool_image *e = (pool_image *)im, *head = nvn_hm_get(&g_by_pool, &key->pool);
+    memcpy(&e->key, key, sizeof *key); e->prev = NULL; e->next = head; if (head) head->prev = e;
+    nvn_hm_put(&g_by_pool, &key->pool, e); g_tex_pool_stats.added++;
+    if (g_tex_pool_stats.added % 256 == 0) tex_pool_profile();
+}
+static void pool_image_del(vkimg_t *im) {
+    if (!im->pool) return;   // serial-only and dummy images have no pool index node
+    pool_image *e = (pool_image *)im;
+    nvn_hm_del(&g_by_key, &e->key);
+    if (e->prev) e->prev->next = e->next;
+    else if (e->next) nvn_hm_put(&g_by_pool, &im->pool, e->next);
+    else nvn_hm_del(&g_by_pool, &im->pool);
+    if (e->next) e->next->prev = e->prev;
+    g_tex_pool_stats.dropped++;
+}
 static pthread_mutex_t g_img_mu = PTHREAD_MUTEX_INITIALIZER;
 // The sRGB / UNORM twin of a format (the one reinterpretation games make of uncompressed colour targets), VK_FORMAT_UNDEFINED when it has none
 static VkFormat srgb_twin(VkFormat f) {
@@ -179,7 +207,7 @@ static VkFormat srgb_twin(VkFormat f) {
 // such a game wants DM_VK_UBWC=2 in its profile
 static int ubwc_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_UBWC"); v = e ? atoi(e) : 3; } return v; }
 static vkimg_t *img_new(const tex_t *t, const vkfmt_t *f) {
-    vkimg_t *im = calloc(1, sizeof *im);
+    vkimg_t *im = calloc(1, t->pool ? sizeof(pool_image) : sizeof *im);
     const nvn_texdesc *d = &t->d;
     im->w = d->width ? d->width : 1; im->h = d->target == 0 || d->target == 3 ? 1 : (d->height ? d->height : 1);
     im->d = d->target == 2 ? (d->depth ? d->depth : 1) : 1; im->layers = layers_of(d);
@@ -281,8 +309,9 @@ static void vk_tex_view_drop_all(vkimg_t *im);
 // image's last rendering is logged ([alias] stale read), to find what a game reinterprets
 static uint64_t g_wseq;
 static void alias_link(vkimg_t *im) {
-    for (uint32_t i = 0; i < g_by_key.cap; i++) {
-        vkimg_t *o = g_by_key.vals[i]; if (!o || o == im || o->pool != im->pool || o->off >= im->off + im->size || im->off >= o->off + o->size) continue;
+    for (pool_image *e = nvn_hm_get(&g_by_pool, &im->pool); e; e = e->next) {
+        g_tex_pool_stats.alias_visits++;
+        vkimg_t *o = &e->im; if (o == im || o->off >= im->off + im->size || im->off >= o->off + o->size) continue;
         if (im->novl < 8 && o->novl < 8) { im->ovl[im->novl++] = o; o->ovl[o->novl++] = im; }
     }
 }
@@ -305,19 +334,31 @@ extern uint64_t g_tex_frame;   // presents so far, for the packaged textures' la
 // last EVICT_KEEP presents go (their memory now holds another texture; one drawn again is made and filled again). Called with g_img_mu held
 enum { EVICT_KEEP = 60 };
 static uint64_t g_img_n, g_img_bytes, g_img_evicted;   // live images and their bytes, images evicted so far (vk_tex_sweep's line)
-static void img_drop(vkimg_t *im) { vk_lrz_forget(im); if (im->lin_mem) nvn_dirty_release(im->lin_mem, im->lin_len); if (im->packaged && !im->pkg_released && im->pkg_mem) nvn_dirty_release(im->pkg_mem, im->pkg_len); g_img_n--; g_img_bytes -= im->size > 0 ? (uint64_t)im->size : 0; alias_unlink(im); vk_tex_view_drop_all(im); if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem); free(im); }
+static void img_drop(vkimg_t *im) { vk_lrz_forget(im); if (im->lin_mem) nvn_dirty_release(im->lin_mem, im->lin_len); if (im->packaged && !im->pkg_released && im->pkg_mem) nvn_dirty_release(im->pkg_mem, im->pkg_len); g_img_n--; g_img_bytes -= im->size > 0 ? (uint64_t)im->size : 0; alias_unlink(im); pool_image_del(im); vk_tex_view_drop_all(im); if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem); free(im); }
 static void evict_overlaps(uint64_t pool, int64_t off, int64_t size) {
-    akey ks[64]; int n = 0;
-    for (uint32_t i = 0; i < g_by_key.cap && n < 64; i++) {
-        vkimg_t *o = g_by_key.vals[i]; if (!o || o->pool != pool || o->off >= off + size || off >= o->off + o->size || g_tex_frame - o->used < EVICT_KEEP) continue;
-        memcpy(&ks[n++], g_by_key.keys + (size_t)i * g_by_key.klen, sizeof(akey));
+    vkimg_t *images[64]; int n = 0;
+    for (pool_image *e = nvn_hm_get(&g_by_pool, &pool); e && n < 64; e = e->next) {
+        g_tex_pool_stats.evict_visits++;
+        vkimg_t *o = &e->im; if (o->off >= off + size || off >= o->off + o->size || g_tex_frame - o->used < EVICT_KEEP) continue;
+        images[n++] = o;
     }
-    for (int j = 0; j < n; j++) { vkimg_t *o = nvn_hm_get(&g_by_key, &ks[j]); if (!o) continue; nvn_hm_del(&g_by_key, &ks[j]); img_drop(o); g_img_evicted++; }
+    for (int j = 0; j < n; j++) { img_drop(images[j]); g_img_evicted++; }
 }
-static vkimg_t *vk_tex_(const tex_t *t);
-vkimg_t *vk_tex(const tex_t *t) { extern int g_prof_on; extern uint64_t g_prof_ns[8]; struct timespec a, b; if (g_prof_on) clock_gettime(CLOCK_MONOTONIC, &a);
-    vkimg_t *im = vk_tex_(t); if (g_prof_on) { clock_gettime(CLOCK_MONOTONIC, &b); g_prof_ns[1] += (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec)); } return im; }
-static vkimg_t *vk_tex_(const tex_t *t) {
+static vkimg_t *vk_tex_(const tex_t *t, int copy_dst);
+static vkimg_t *vk_tex_timed(const tex_t *t, int copy_dst) { extern int g_prof_on; extern uint64_t g_prof_ns[8]; struct timespec a, b; if (g_prof_on) clock_gettime(CLOCK_MONOTONIC, &a);
+    vkimg_t *im = vk_tex_(t, copy_dst); if (g_prof_on) { clock_gettime(CLOCK_MONOTONIC, &b); g_prof_ns[1] += (uint64_t)((b.tv_sec - a.tv_sec) * 1000000000ll + (b.tv_nsec - a.tv_nsec)); } return im; }
+vkimg_t *vk_tex(const tex_t *t) { return vk_tex_timed(t, 0); }
+// A fresh ordinary copy destination can transition in the main command buffer
+// immediately before the copy. Packaged/CPU-written/linear uploads stay unchanged.
+static uint64_t g_copy_dst_preparations;
+vkimg_t *vk_tex_copy_dst(const tex_t *t) { return vk_tex_timed(t, 1); }
+void vk_tex_copy_profile(int to_texture) {
+    static uint64_t uploads, downloads; if (to_texture) uploads++; else downloads++;
+    static int enabled = -1; if (enabled < 0) { const char *e = getenv("DM_VK_UPLOAD_PROF"); enabled = e && atoi(e); }
+    if (enabled && ((uploads + downloads) % 256 == 0)) VKLOG("texture transfer: executed buffer_to_image %llu image_to_buffer %llu; new-image preparations moved to main %llu",
+        (unsigned long long)uploads, (unsigned long long)downloads, (unsigned long long)g_copy_dst_preparations);
+}
+static vkimg_t *vk_tex_(const tex_t *t, int copy_dst) {
     if (!t || !t->serial || t->magic != MAGIC('T', 'E', 'X', 0)) return NULL;
     const vkfmt_t *f = vk_fmt(t->d.format);
     if (!f) { VKRED_ONCE(14, "texture format %#x has no Vulkan counterpart here (first case %ux%u target %d)", t->d.format, t->d.width, t->d.height, t->d.target); return NULL; }
@@ -336,7 +377,7 @@ static vkimg_t *vk_tex_(const tex_t *t) {
         if (keyed) evict_overlaps(k.pool, t->off, (int64_t)t->L.size);
         im = img_new(t, f); if (!im) { pthread_mutex_unlock(&g_img_mu); return NULL; }
         im->pool = k.pool; im->off = t->off; im->size = (int64_t)t->L.size; im->flags = t->d.flags; g_img_n++; g_img_bytes += t->L.size;
-        if (keyed) { alias_link(im); nvn_hm_put(&g_by_key, &k, im); } else nvn_hm_put(&g_by_serial, &t->serial, im);
+        if (keyed) { alias_link(im); nvn_hm_put(&g_by_key, &k, im); pool_image_add(im, &k); } else nvn_hm_put(&g_by_serial, &t->serial, im);
         fresh = 1;
     }
     im->used = g_tex_frame;
@@ -362,7 +403,10 @@ static vkimg_t *vk_tex_(const tex_t *t) {
             }
             im->pkg_seen = now;
         }
-    } else if (fresh) vk_tex_prepare(vk_upload_cmd(), im);
+    } else if (fresh) {
+        if (copy_dst) g_copy_dst_preparations++;
+        else vk_tex_prepare(vk_upload_cmd(), im);
+    }
     return im;
 }
 // Read-only preflight for texture-barrier deferral. Do not call vk_tex/view here:
@@ -423,14 +467,12 @@ void vk_tex_sweep(void) {
                     (unsigned long long)idle, PKG_IDLE, (unsigned long long)lru, (unsigned long long)(nvn_dirty_released() - before), (unsigned long long)total, runs);
 }
 void vk_tex_drop_pool(const void *pool) {   // the pool is finalized: its textures' images go once the GPU is done with them
+    uint64_t key = (uint64_t)(uintptr_t)pool;
     pthread_mutex_lock(&g_img_mu);
-    for (uint32_t i = 0; i < g_by_key.cap; i++) {
-        if (!g_by_key.vals[i]) continue;
-        akey k; memcpy(&k, g_by_key.keys + (size_t)i * g_by_key.klen, sizeof k);
-        if (k.pool != (uint64_t)(uintptr_t)pool) continue;
-        vkimg_t *im = g_by_key.vals[i]; nvn_hm_del(&g_by_key, &k); i = (uint32_t)-1;   // the table was rehashed by the delete: rescan
-        img_drop(im);
-    }
+    pool_image *e = nvn_hm_get(&g_by_pool, &key);
+    g_tex_pool_stats.drop_calls++; if (!e) g_tex_pool_stats.empty_drops++;
+    while (e) { pool_image *next = e->next; img_drop(&e->im); e = next; }
+    if (g_tex_pool_stats.drop_calls % 1024 == 0) tex_pool_profile();
     pthread_mutex_unlock(&g_img_mu);
 }
 // CPU-written textures (WriteTexels / a dirty first use): packaged from now on

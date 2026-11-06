@@ -4,6 +4,12 @@
 # Docked outdoor menu, same-process guarded texture-barrier off/on/off:
 # 18.96/30.00/17.30 FPS; 346/52/346 passes, 1024 draws and 2 dispatches unchanged.
 # Comparison held full state rebinding in all phases; guarded mode now includes it.
+# Loading staging reuse: 2676 copied GPU allocations -> 7 allocations + 2669 reuses; bounded 1 MiB.
+# Retained for resource reduction at user request; no loading-time improvement claimed.
+# Per-pool texture index: 116 checks passed; 34816 empty pool drops bypassed full scans on PJD110.
+# Same-pool overlap/alias checks retained; this index build awaits user save graphics confirmation.
+# Adaptive pacing disabled at user request: outdoor menu observed 30.00 -> 45.82 FPS after restart.
+# Camera differed slightly, draws 1257 -> 1382; not an exact-workload A/B or a peak-utilization claim.
 # User reached the cabin with normal visible graphics; sustained progression and save/reload remain unverified.
 status	boots
 tested	1.7.3 PJD110 (Adreno 750)
@@ -20,3 +26,5 @@ env	DM_VK_SKIP_EMPTY_BARRIER=1
 env	DM_VK_TEXTURE_BARRIER=2
 env	DM_ADPF_WORKERS=1
 env	DM_PIN_GAME=1
+env	DM_VK_STAGING_CACHE=1
+env	DM_ADAPTIVE_FPS=0

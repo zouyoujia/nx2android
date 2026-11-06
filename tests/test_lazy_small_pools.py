@@ -36,7 +36,7 @@ class LazySmallPools(unittest.TestCase):
         prefix = begin[begin.index('{') + 1:begin.index('    if (g_tsq)')]
         begin_test = 'static void tested_begin(void) {' + prefix + '\n    g_cur = -1; pthread_mutex_unlock(&g_sub_lock);\n}\n'
         names = ('lazy_small_pools', 'zc_over', 'zc_under', 'vk_mem_type',
-                 'pool_allocate_copy', 'pool_add_one', 'pool_add_impl',
+                 'staging_cache_defer', 'pool_allocate_copy', 'pool_add_one', 'pool_add_impl',
                  'mtl_pool_add', 'mtl_pool_add_flags', 'pool_prepare_submission',
                  'mtl_pool_del', 'vk_pool_remap_ro', 'vk_pools_sync_')
         implementations = '\n'.join(function(source, name) for name in names)
@@ -58,6 +58,7 @@ class LazySmallPools(unittest.TestCase):
 #include <time.h>
 #include <unistd.h>
 #include "cpu_small_upload.h"
+#include "staging_cache.h"
 #ifndef SOCK_CLOEXEC
 #define SOCK_CLOEXEC 0
 #endif
@@ -83,8 +84,10 @@ static void log_line(const char *format,...){(void)format;}
 #define VKCHK(call) do { VkResult status=(call); assert(status==VK_SUCCESS); } while(0)
 static _Noreturn void die(const char *format,...){(void)format;abort();}
 static void vk_init(void){}
-static void pool_ord_make(void){}
+static void pool_ord_add(void){}
+static void pool_ord_del(int i){(void)i;}
 static void pool_profile_report(void){}
+static void df_add(int kind,void *a,void *b){assert(kind==5 && !b);wait_calls++;assert(staging_cache_return(a));free(a);}
 static VkResult vkCreateBuffer(VkDevice device,const VkBufferCreateInfo *info,const VkAllocationCallbacks *a,VkBuffer *out){
     (void)a;assert(device==V.dev && create_calls<127);*out=(VkBuffer)(uintptr_t)++create_calls;buffer_size[create_calls]=info->size;return VK_SUCCESS;
 }
@@ -149,12 +152,31 @@ static void *register_worker(void *arg){
 }
 int main(int argc,char **argv){
     (void)cpu_small_upload_record;(void)cpu_small_upload_pools; // covered by the small-copy tests
-    assert(argc==4);int lazy=atoi(argv[1]),cpu=atoi(argv[2]),minimum=atoi(argv[3]);
+    assert(argc==5);int cache=atoi(argv[4]);int lazy=atoi(argv[1]),cpu=atoi(argv[2]),minimum=atoi(argv[3]);
     setenv("DM_VK_LAZY_SMALL_POOLS",argv[1],1);setenv("DM_VK_CPU_SMALL_UPLOADS",argv[2],1);setenv("DM_VK_ZEROCOPY_MIN_KB",argv[3],1);
+    setenv("DM_VK_STAGING_CACHE",argv[4],1);
     unsetenv("DM_VK_NO_ZEROCOPY");unsetenv("DM_VK_ZEROCOPY_MAX_MB");unsetenv("DM_VK_POOL_PROF");
     V.dev=(VkDevice)(uintptr_t)1;V.mem.memoryTypeCount=1;V.mem.memoryTypes[0].propertyFlags=VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
     assert(!posix_memalign((void **)&guest_a,4096,131072));assert(!posix_memalign((void **)&guest_b,4096,131072));
     memset(guest_a,0x13,131072);memset(guest_b,0x47,131072);
+    if(cache){
+        mtl_pool_add_flags(guest_a,4096,2);assert(g_pool[0].lazy && !allocate_calls);
+        assert(pool_prepare_submission());assert(allocate_calls==1 && !g_pool[0].synced);
+        vk_pools_sync_(VK_NULL_HANDLE);uint8_t *saved=g_pool[0].shadow;
+        assert(!memcmp(saved,guest_a,4096));mtl_pool_del(guest_a);assert(!g_npool && wait_calls==1);
+        mtl_pool_add_flags(guest_b,4096,2);assert(g_pool[0].lazy);
+        assert(pool_prepare_submission());assert(allocate_calls==1 && g_pool[0].shadow==saved && !g_pool[0].synced && !g_pool[0].span);
+        assert(!memcmp(saved,guest_a,4096));vk_pools_sync_(VK_NULL_HANDLE);
+        assert(!memcmp(saved,guest_b,4096) && g_pool[0].synced);
+        assert(g_pool_stats.materialized==2 && g_pool_stats.copy_allocations==1);
+        mtl_pool_del(guest_b);assert(wait_calls==2);
+        vkpool_t unknown={.lo=(uint64_t)guest_a,.hi=(uint64_t)guest_a+4096,.flags=-1};
+        pool_allocate_copy(&unknown);assert(allocate_calls==2 && unknown.shadow!=saved);
+        assert(!staging_cache_defer(&unknown));
+        vk_defer_free_buffer(unknown.buf,unknown.mem);
+        free(guest_a);free(guest_b);puts("cached staging resync passed");return 0;
+    }
+
     for(int i=0;i<NSLOT;i++){g_slot[i].mains[0]=(VkCommandBuffer)(uintptr_t)1;g_slot[i].ups[0]=(VkCommandBuffer)(uintptr_t)2;}
     int enabled=lazy>0 && cpu==1;
     if(!minimum){ // A pool using the zero-copy policy must never be lazily converted to copied backing.
@@ -204,7 +226,7 @@ int main(int argc,char **argv){
                                      '-I'+str(DM/'third_party/vulkan-headers/include'), '-I'+str(DM/'android'),
                                      '-I'+str(DM/'gfx/nvn/include'), str(src), '-o', str(exe)], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
-            for lazy, cpu, minimum in (('1', '1', '64'), ('0', '1', '64'), ('1', '0', '64'), ('1', '2', '64'), ('1', '1', '0')):
+            for lazy, cpu, minimum, cache in (('1', '1', '64', '0'), ('0', '1', '64', '0'), ('1', '0', '64', '0'), ('1', '2', '64', '0'), ('1', '1', '0', '0'), ('1', '1', '64', '1')):
                 with self.subTest(lazy=lazy, cpu=cpu, minimum=minimum):
-                    result = subprocess.run([str(exe), lazy, cpu, minimum], capture_output=True, text=True, timeout=10)
+                    result = subprocess.run([str(exe), lazy, cpu, minimum, cache], capture_output=True, text=True, timeout=10)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

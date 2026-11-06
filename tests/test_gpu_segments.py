@@ -129,7 +129,7 @@ int main(void){
     def test_actual_vulkan_hooks_default_off_nesting_slot_snapshot_and_failed_submission(self):
         source=(DM/'android/gfx_vk_core.c').read_text()
         names=('vk_gpu_segments_request','gpu_segment_stamp','vk_gpu_segment_begin',
-               'vk_gpu_segment_end','gpu_segment_part_begin','gpu_segment_part_end',
+               'vk_gpu_segment_end','gpu_segment_cpu','gpu_segment_part_begin','gpu_segment_part_end',
                'gpu_segment_sub_begin','gpu_segment_snapshot','gpu_segment_collect','vk_img_barrier_all')
         implementations='\n'.join(function(source,name) for name in names)
         capture=re.search(r'typedef struct \{[^\n]+\} gpu_capture;',source).group()
@@ -141,6 +141,12 @@ int main(void){
         self.assertGreater(split.index('gpu_segment_part_begin()'),split.index('vkBeginCommandBuffer(s->main'))
         commit=function(source,'mtl_sub_commit')
         self.assertLess(commit.index('gpu_segment_part_end()'),commit.index('vkEndCommandBuffer(s->main)'))
+        self.assertLess(split.index('gpu_segment_cpu(2)'),split.index('gpu_segment_cpu(3)'))
+        self.assertLess(split.index('gpu_segment_cpu(3)'),split.index('vkQueueSubmit('))
+        self.assertGreater(split.index('gpu_segment_cpu(4)'),split.index('vkQueueSubmit('))
+        self.assertLess(commit.index('gpu_segment_cpu(2)'),commit.index('gpu_segment_cpu(3)'))
+        self.assertGreater(commit.index('gpu_segment_cpu(4)'),commit.index('vkQueueSubmit('))
+
         self.compile_run(r'''
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan_core.h>
@@ -148,6 +154,7 @@ int main(void){
 #include <stdlib.h>
 #include <stdio.h>
 #include "gpu_segments.h"
+#include <time.h>
 #define NSLOT 6
 #define VKLOG(...) do {if(0)fprintf(stderr,__VA_ARGS__);} while(0)
 static VkQueryPool g_gsq;static vk_gs_state g_gs_slot[NSLOT];static int g_gs_active,g_cur=2;
@@ -185,9 +192,14 @@ int main(void){
     vk_img_barrier_all(main_cb);assert(writes==5 && barriers==5);
     gpu_segment_part_end();assert(writes==6);main_cb=(VkCommandBuffer)(uintptr_t)17;gpu_segment_part_begin();assert(writes==7);
     gpu_segment_part_end();assert(writes==8);
+    gpu_segment_cpu(2);gpu_segment_cpu(3);gpu_segment_cpu(4);
+    assert(g_gs_slot[2].cpu[0][0] && g_gs_slot[2].cpu[0][1]>=g_gs_slot[2].cpu[0][0]);
+    for(int i=1;i<5;i++)assert(g_gs_slot[2].cpu[1][i]>=g_gs_slot[2].cpu[1][i-1]);
+
     gpu_capture *c=gpu_segment_snapshot(0);assert(c && !g_gs_active && c->state.nq==8 && c->state.np==2);
     memset(&g_gs_slot[2],0,sizeof g_gs_slot[2]);
     assert(c->state.nr==2 && c->state.nested==2);
+    assert(c->state.cpu[0][0] && c->state.cpu[1][4]>=c->state.cpu[1][0]);
     final_fence_passed=1;gpu_segment_collect(c,2);assert(reads==1 && !c->result);
     vk_gs_totals t=vk_gs_reduce(&c->state,c->query,64);assert(!t.invalid && t.span==70 && t.between_parts==10 && t.in_parts==60);
     free(c);assert(!gpu_segment_snapshot(0));
