@@ -365,6 +365,21 @@ static vkimg_t *vk_tex_(const tex_t *t) {
     } else if (fresh) vk_tex_prepare(vk_upload_cmd(), im);
     return im;
 }
+// Read-only preflight for texture-barrier deferral. Do not call vk_tex/view here:
+// creating or refreshing an image can record uploads before the guard has ended
+// the current pass. Unknown, linear, sparse, fresh or dirty images force fallback.
+int vk_tex_barrier_ready(const tex_t *t) {
+    if (!t || !t->serial || !t->pool || !t->mem || t->magic != MAGIC('T', 'E', 'X', 0) ||
+        (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_SPARSE))) return 0;
+    const vkfmt_t *f = vk_fmt(t->d.format); if (!f || t->d.target == NVN_TEXTURE_TARGET_BUFFER) return 0;
+    akey k; memset(&k, 0, sizeof k); k.pool = (uint64_t)(uintptr_t)t->pool; k.off = t->off; k.d = t->d;
+    k.d.flags &= NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_SPARSE | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_MINIMAL_LAYOUT | (f->depth || f->stencil ? 0 : NVN_TEXTURE_FLAGS_IMAGE);
+    pthread_mutex_lock(&g_img_mu); vkimg_t *im = nvn_hm_get(&g_by_key, &k);
+    int ok = im && im->layout == VK_IMAGE_LAYOUT_GENERAL && im->size > 0 && (uint64_t)im->size == t->L.size;
+    if (ok && packaged_tex(t) && !im->packaged) ok = 0;
+    if (ok && im->packaged && (im->pkg_released || nvn_dirty_since_span(im->pkg_span, t->mem, t->L.size, im->pkg_stamp))) ok = 0;
+    pthread_mutex_unlock(&g_img_mu); return ok;
+}
 // Packaged textures give up their write protection (nvn_dirty_release; drawn again, they are uploaded and protected again) when not drawn for PKG_IDLE presents, and the
 // least recently drawn ones beyond that while the protected runs, each splitting its pool's mapping, are more than PKG_RUNS (textures stay protected until the game writes them).
 // Textures drawn in the last PKG_KEEP presents keep theirs (released, they would be uploaded again at once). Swept every 300 presents, with the pools whose mapping the
@@ -466,7 +481,7 @@ static pthread_mutex_t g_view_mu = PTHREAD_MUTEX_INITIALIZER;
 extern uint64_t g_tex_gen;
 static void vk_tex_view_drop_all(vkimg_t *im) {
     pthread_mutex_lock(&g_view_mu);
-    vview *v = nvn_hm_get(&g_views, &im); g_tex_gen++;
+    vview *v = nvn_hm_get(&g_views, &im); __atomic_fetch_add(&g_tex_gen, 1, __ATOMIC_RELEASE);
     while (v) { vview *n = v->next; vk_defer_free_view(v->v); free(v); v = n; }
     nvn_hm_del(&g_views, &im);
     pthread_mutex_unlock(&g_view_mu);
@@ -587,7 +602,7 @@ void mtl_reg_tex(int tid, const tex_t *t, const view_t *v) {
     uint64_t seq = nvn_jobs_queued();
     pthread_mutex_lock(&g_rmu);
     if (tid >= g_ntreg) { int n = tid + 1024; g_treg = realloc(g_treg, n * sizeof *g_treg); memset(g_treg + g_ntreg, 0, (n - g_ntreg) * sizeof *g_treg); g_ntreg = n; }
-    g_tex_gen++; treg_t *r = &g_treg[tid];
+    __atomic_fetch_add(&g_tex_gen, 1, __ATOMIC_RELEASE); treg_t *r = &g_treg[tid];
     if (r->cur.ok && seq) {   // keep the one replaced for the jobs queued before this registration
         if (!r->old) r->old = calloc(TREG_OLD, sizeof *r->old);
         if (r->old) { memmove(r->old + 1, r->old, sizeof *r->old * (TREG_OLD - 1)); r->old[0] = r->cur; }

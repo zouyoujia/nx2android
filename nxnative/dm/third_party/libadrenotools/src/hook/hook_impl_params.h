@@ -18,14 +18,17 @@ struct HookImplParams {
     std::string customDriverName;
     std::string fileRedirectDir;
     adrenotools_gpu_mapping *nextGpuMapping;
+    adrenotools_kgsl_perf_stats *kgslPerfStats;
+    bool (**kgslPerfDiagnose)(void);
 
     HookImplParams(int featureFlags, const char *tmpLibDir, const char *hookLibDir, const char *customDriverDir,
-                  const char *customDriverName, const char *fileRedirectDir, adrenotools_gpu_mapping *nextGpuMapping)
+                  const char *customDriverName, const char *fileRedirectDir, adrenotools_gpu_mapping *nextGpuMapping,
+                  adrenotools_kgsl_perf_stats *kgslPerfStats, bool (**kgslPerfDiagnose)(void) = nullptr)
         : featureFlags(featureFlags),
           tmpLibDir(tmpLibDir ? tmpLibDir : ""),
           hookLibDir(hookLibDir),
           customDriverDir(customDriverDir ? customDriverDir : ""),
           customDriverName(customDriverName ? customDriverName : ""),
           fileRedirectDir(fileRedirectDir ? fileRedirectDir : ""),
-          nextGpuMapping(nextGpuMapping) {}
+          nextGpuMapping(nextGpuMapping), kgslPerfStats(kgslPerfStats), kgslPerfDiagnose(kgslPerfDiagnose) {}
 };

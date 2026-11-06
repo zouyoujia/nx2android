@@ -31,6 +31,16 @@ extern "C" {
 void *adrenotools_open_libvulkan(int dlopenMode, int featureFlags, const char *tmpLibDir, const char *hookLibDir, const char *customDriverDir, const char *customDriverName, const char *fileRedirectDir, void **userMappingHandle);
 
 /**
+ * @brief Copies process-lifetime context-hook counters; false if KGSL_PERF was never requested.
+ * @note A loaded Vulkan loader with zero intercepted/accepted contexts is not an active request.
+ * The caller may poll after device creation and real submissions to account for lazy contexts.
+ */
+bool adrenotools_get_kgsl_perf_stats(struct adrenotools_kgsl_perf_stats *out);
+
+/** Read-only binding diagnostics; true means an ioctl PLT slot was read, not activation. */
+bool adrenotools_kgsl_perf_diagnose(void);
+
+/**
  * @brief Imports the given CPU mapped memory range into the GSL allocator. This should then be followed by a call to vkAllocateMemory with a matching size which will return a VkDeviceMemory view over the input region
  * @param handle Mapping handle that was returned by adrenotools_open_libvulkan
  * @param hostPtr The host pointer to import

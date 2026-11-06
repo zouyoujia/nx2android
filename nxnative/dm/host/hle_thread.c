@@ -696,11 +696,37 @@ int svc_thread(int num, uint64_t *regs) {
 }
 // DM_SLEEP_BT=<min ms>[-<max ms>] (live, a DM_CTL env line): the next 64 sleeps and timed waits (SleepThread, condition variables, WaitForAddress,
 // WaitSynchronization) whose time lies in that range, with their backtraces: who paces a game that holds a frame rate with no present interval (a frame limiter)
+// Disabled diagnostics must not scan the environment on every short wait. Read
+// startup once; development env notifications publish live changes under the lock.
+static pthread_mutex_t g_wait_bt_mu = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic int g_wait_bt_state;   // 0: startup unread, 1: off, 2: range enabled
+static char g_wait_bt_last[32]; static double g_wait_bt_lo, g_wait_bt_hi; static unsigned g_wait_bt_count;
+static void wait_bt_config_locked(const char *e) {
+    if (e && *e) {
+        if (strncmp(e, g_wait_bt_last, sizeof g_wait_bt_last - 1)) { snprintf(g_wait_bt_last, sizeof g_wait_bt_last, "%s", e); char *d;
+            g_wait_bt_lo = strtod(e, &d); g_wait_bt_hi = *d == '-' ? strtod(d + 1, NULL) : 1e9; g_wait_bt_count = 0; }
+        atomic_store_explicit(&g_wait_bt_state, g_wait_bt_lo > 0 ? 2 : 1, memory_order_release);
+    } else atomic_store_explicit(&g_wait_bt_state, 1, memory_order_release);
+}
+static int wait_bt_state(void) {
+    int state = atomic_load_explicit(&g_wait_bt_state, memory_order_acquire);
+    if (!state) { pthread_mutex_lock(&g_wait_bt_mu);
+        if (!atomic_load_explicit(&g_wait_bt_state, memory_order_relaxed)) wait_bt_config_locked(getenv("DM_SLEEP_BT"));
+        state = atomic_load_explicit(&g_wait_bt_state, memory_order_relaxed); pthread_mutex_unlock(&g_wait_bt_mu); }
+    return state;
+}
+void dm_thread_runtime_env_changed(const char *name, const char *value) {
+    if (!name || strcmp(name, "DM_SLEEP_BT")) return;
+    pthread_mutex_lock(&g_wait_bt_mu); wait_bt_config_locked(value); pthread_mutex_unlock(&g_wait_bt_mu);
+}
 static void wait_bt(const char *what, int64_t ns, uint64_t fp) {
-    static char last[32]; static double lo, hi; static _Atomic int nbt; const char *e = getenv("DM_SLEEP_BT");
-    if (!e || !*e) return;
-    if (strncmp(e, last, sizeof last - 1)) { snprintf(last, sizeof last, "%s", e); char *d; lo = strtod(e, &d); hi = *d == '-' ? strtod(d + 1, NULL) : 1e9; atomic_store(&nbt, 0); }
-    if (lo > 0 && ns >= (int64_t)(lo * 1e6) && ns <= (int64_t)(hi * 1e6) && atomic_fetch_add(&nbt, 1) < 64) { void dm_backtrace(uint64_t fp); LOG("%s %.2f ms", what, ns / 1e6); dm_backtrace(fp); }
+    if (wait_bt_state() != 2) return;
+    pthread_mutex_lock(&g_wait_bt_mu);
+    int show = atomic_load_explicit(&g_wait_bt_state, memory_order_relaxed) == 2 &&
+        ns >= (int64_t)(g_wait_bt_lo * 1e6) && ns <= (int64_t)(g_wait_bt_hi * 1e6) && g_wait_bt_count < 64;
+    if (show) g_wait_bt_count++;
+    pthread_mutex_unlock(&g_wait_bt_mu);
+    if (show) { void dm_backtrace(uint64_t fp); LOG("%s %.2f ms", what, ns / 1e6); dm_backtrace(fp); }
 }
 static int svc_thread_impl(int num, uint64_t *regs) {
     { thr_t *me = pthread_getspecific(g_keythr); if (me) { me->last_svc = num; me->last_lr = regs[30]; me->nsvc++; } }

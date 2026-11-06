@@ -1,8 +1,22 @@
 # DRAGON QUEST BUILDERS 2, Hong Kong 1.7.3, KTGL / SDK 5.4.0.
-# PJD110 / Adreno 750, 2026-11-04: title screen confirmed with the stock driver.
-# Gameplay, save/reload and sustained progression remain unverified.
+# PJD110 / Adreno 750, 2026-11-06: stock-driver title and user-entered save confirmed.
+# Docked dialogue, empty-barrier fix off/on/off: 18.42/30.00/18.11 FPS.
+# Docked outdoor menu, same-process guarded texture-barrier off/on/off:
+# 18.96/30.00/17.30 FPS; 346/52/346 passes, 1024 draws and 2 dispatches unchanged.
+# Comparison held full state rebinding in all phases; guarded mode now includes it.
+# User reached the cabin with normal visible graphics; sustained progression and save/reload remain unverified.
 status	boots
 tested	1.7.3 PJD110 (Adreno 750)
 package	org.nx2a.dqb2
 orientation	landscape
 requires	bcn
+env	DM_NVN_PROF=0
+env	DM_VK_ZEROCOPY_MIN_KB=64
+env	DM_VK_CPU_SMALL_UPLOADS=1
+env	DM_VK_LAZY_SMALL_POOLS=1
+env	DM_VK_EARLY_COMPLETE=1
+env	DM_VK_COMPUTE_WARM_SEEN=1
+env	DM_VK_SKIP_EMPTY_BARRIER=1
+env	DM_VK_TEXTURE_BARRIER=2
+env	DM_ADPF_WORKERS=1
+env	DM_PIN_GAME=1

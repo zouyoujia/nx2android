@@ -16,6 +16,23 @@
 #include <adrenotools/driver.h>
 #include <unistd.h>
 
+static adrenotools_kgsl_perf_stats kgslPerfStats{};
+static bool kgslPerfRequested;
+static bool (*kgslPerfDiagnose)(void);
+
+bool adrenotools_kgsl_perf_diagnose(void) {
+    auto diagnose = __atomic_load_n(&kgslPerfDiagnose, __ATOMIC_ACQUIRE);
+    return diagnose ? diagnose() : false;
+}
+
+bool adrenotools_get_kgsl_perf_stats(struct adrenotools_kgsl_perf_stats *out) {
+    if (!out) return false;
+#define COPY(field) out->field = __atomic_load_n(&kgslPerfStats.field, __ATOMIC_RELAXED)
+    COPY(intercepted); COPY(flagged); COPY(fallback); COPY(accepted); COPY(refused);
+#undef COPY
+    return __atomic_load_n(&kgslPerfRequested, __ATOMIC_RELAXED);
+}
+
 void *adrenotools_open_libvulkan(int dlopenFlags, int featureFlags, const char *tmpLibDir, const char *hookLibDir, const char *customDriverDir, const char *customDriverName, const char *fileRedirectDir, void **userMappingHandle) {
     // Bail out if linkernsbypass failed to load, this probably means we're on api < 28
     if (!linkernsbypass_load_status())
@@ -84,7 +101,9 @@ void *adrenotools_open_libvulkan(int dlopenFlags, int featureFlags, const char *
         }
     }()};
 
-    initHookParam(new HookImplParams(featureFlags, tmpLibDir, hookLibDir, customDriverDir, customDriverName, fileRedirectDir, importMapping));
+    const bool kgslPerf = featureFlags & ADRENOTOOLS_DRIVER_KGSL_PERF;
+    if (kgslPerf) __atomic_store_n(&kgslPerfRequested, true, __ATOMIC_RELAXED);
+    initHookParam(new HookImplParams(featureFlags, tmpLibDir, hookLibDir, customDriverDir, customDriverName, fileRedirectDir, importMapping, kgslPerf ? &kgslPerfStats : nullptr, kgslPerf ? &kgslPerfDiagnose : nullptr));
 
     // Load the libvulkan hook into the isolated namespace
     if (!linkernsbypass_namespace_dlopen("libmain_hook.so", RTLD_GLOBAL, hookNs))

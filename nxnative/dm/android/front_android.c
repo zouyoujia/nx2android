@@ -48,6 +48,7 @@ static void on_window_created(ANativeActivity *a, ANativeWindow *w) { (void)a; p
 static void on_window_destroyed(ANativeActivity *a, ANativeWindow *w) { (void)a; (void)w; pthread_mutex_lock(&g_win_mu); g_win = NULL; pthread_mutex_unlock(&g_win_mu); vk_window_lost(); }
 
 void dm_focus_set(int st); void dm_audio_suspend(int on); void guest_clock_freeze_for(int reason, int on); void dm_gfx_suspend(int on);
+void dm_perf_activity_changed(void);   // invalidate work intervals that cross a pause, menu, keyboard or focus change
 // ---- settings (the pause menu's), kept in the files folder as KEY=VALUE lines ----
 static char g_root[512];
 static _Atomic int g_set_overlay = 1, g_set_rumble = 1, g_set_fps;   // the gamepad shown; rumble and tap vibration; the frame rate counter (top left)
@@ -101,7 +102,7 @@ static _Atomic int g_tx_on;   // text entry open (front_text_input): the game is
 static void hold_sync(void) {
     pthread_mutex_lock(&g_hold_mu);
     int want = atomic_load(&g_bg) || atomic_load(&g_menu) || atomic_load(&g_tx_on);
-    if (want != g_held) { g_held = want; if (want) { dm_movie_hold(1); dm_audio_suspend(1); guest_clock_freeze_for(1, 1); } else { guest_clock_freeze_for(1, 0); dm_audio_suspend(0); dm_movie_hold(0); } }
+    if (want != g_held) { dm_perf_activity_changed(); g_held = want; if (want) { dm_movie_hold(1); dm_audio_suspend(1); guest_clock_freeze_for(1, 1); } else { guest_clock_freeze_for(1, 0); dm_audio_suspend(0); dm_movie_hold(0); } }
     pthread_mutex_unlock(&g_hold_mu);
 }
 static void shake_sensor(int on);   // the accelerometer, off in the background (input, below)
@@ -112,7 +113,7 @@ static void on_pause(ANativeActivity *a) { (void)a; go_background(); }
 // Back in front, the game is out of focus until the window has the input focus again (Android sends it after onResume): without this it stayed OutOfFocus for good,
 // and Blasphemous 2's Unity, which asks for focus notifications, kept its title paused and ignored every press after a trip to another app. A window losing focus while in
 // front (a system dialog, the notification shade) is OutOfFocus as on the Switch's HOME overlay
-static void on_window_focus(ANativeActivity *a, int focused) { (void)a; if (atomic_load(&g_running) && !atomic_load(&g_bg)) dm_focus_set(focused ? 1 : 2); }
+static void on_window_focus(ANativeActivity *a, int focused) { (void)a; dm_perf_activity_changed(); if (atomic_load(&g_running) && !atomic_load(&g_bg)) dm_focus_set(focused ? 1 : 2); }
 // A save manager's request asked the app to end (ANativeActivity_onCreate): Activity.finish() when it is resumed, through JNI on the main thread.
 // ANativeActivity_finish, from onCreate or from here, left the activity on the screen (Y700, Android 16), and porter's am start -W waited out its timeout
 static int g_quit;
@@ -835,6 +836,58 @@ static void *input_thread(void *a) {
 static void on_queue_created(ANativeActivity *a, AInputQueue *q) { (void)a; g_queue = q; while (!g_ilooper) usleep(1000); AInputQueue_attachLooper(q, g_ilooper, 1, on_input, NULL); }
 static void on_queue_destroyed(ANativeActivity *a, AInputQueue *q) { (void)a; AInputQueue_detachLooper(q); g_queue = NULL; }
 
+// Opt-in startup loading hint through Android's public GameState API. PJD110's low-load startup
+// is sensitive to power policy; the framework owns this request and its cancellation timeout.
+// The time window is explicit per test/profile, not inferred from the temperature or GPU utilization.
+static int startup_loading_duration(const char *value) {
+    if (!value || !*value) return 0;
+    char *end; long n = strtol(value, &end, 10); if (*end || n <= 0) return 0;
+    return n > 120 ? 120 : (int)n;
+}
+static int startup_loading_wanted(int64_t now, int64_t until, int background) { return now < until && !background; }
+static void *startup_loading_thread(void *arg) {
+    int seconds = (int)(intptr_t)arg; JavaVM *vm = g_act->vm; JNIEnv *E;
+    if ((*vm)->AttachCurrentThread(vm, &E, NULL) != JNI_OK) { LOG("[perf] GameState: Java VM attach failed"); return NULL; }
+    jclass activity = (*E)->GetObjectClass(E, g_act->clazz);
+    jmethodID get = activity ? (*E)->GetMethodID(E, activity, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;") : NULL;
+    if (!get || (*E)->ExceptionCheck(E)) goto unavailable;
+    jstring name = (*E)->NewStringUTF(E, "game");
+    jobject manager = (*E)->CallObjectMethod(E, g_act->clazz, get, name); (*E)->DeleteLocalRef(E, name);
+    if (!manager || (*E)->ExceptionCheck(E)) goto unavailable;
+    jclass mc = (*E)->GetObjectClass(E, manager), sc = (*E)->FindClass(E, "android/app/GameState");
+    if (!mc || !sc || (*E)->ExceptionCheck(E)) goto unavailable;
+    jmethodID ctor = (*E)->GetMethodID(E, sc, "<init>", "(ZI)V");
+    jmethodID set = (*E)->GetMethodID(E, mc, "setGameState", "(Landroid/app/GameState;)V");
+    jmethodID mode = (*E)->GetMethodID(E, mc, "getGameMode", "()I");
+    if (!ctor || !set || !mode || (*E)->ExceptionCheck(E)) goto unavailable;
+    int game_mode = (*E)->CallIntMethod(E, manager, mode); if ((*E)->ExceptionCheck(E)) goto unavailable;
+    LOG("[perf] GameState startup window %d s, system game mode %d", seconds, game_mode);
+    int64_t until = mono_ns() + (int64_t)seconds * 1000000000ll; int last = -1, reports = 0;
+    for (;;) {
+        int64_t now = mono_ns(); int want = startup_loading_wanted(now, until, atomic_load(&g_bg));
+        if (want || want != last) {
+            jobject state = (*E)->NewObject(E, sc, ctor, want ? JNI_TRUE : JNI_FALSE, 4 /* MODE_CONTENT */);
+            if (!state || (*E)->ExceptionCheck(E)) goto unavailable;
+            (*E)->CallVoidMethod(E, manager, set, state); (*E)->DeleteLocalRef(E, state);
+            if ((*E)->ExceptionCheck(E)) goto unavailable;
+            if (want != last) LOG("[perf] GameState isLoading=%d (startup window)", want);
+            reports++; last = want;
+        }
+        if (now >= until) break;
+        sleep(1);   // renew the framework's bounded loading request while this window is active
+    }
+    LOG("[perf] GameState startup window ended after %d reports", reports);
+    (*vm)->DetachCurrentThread(vm); return NULL;
+unavailable:
+    if ((*E)->ExceptionCheck(E)) (*E)->ExceptionClear(E);
+    LOG("[perf] GameState loading hint unavailable or refused"); (*vm)->DetachCurrentThread(vm); return NULL;
+}
+static void startup_loading_start(void) {
+    int seconds = startup_loading_duration(getenv("DM_GAME_LOADING_SECONDS")); if (!seconds) return;
+    pthread_t t; if (!pthread_create(&t, NULL, startup_loading_thread, (void *)(intptr_t)seconds)) pthread_detach(t);
+    else LOG("[perf] GameState loading worker could not start");
+}
+
 // ---- the host ----
 int main(int argc, char **argv);   // dm/host/main.c
 static void *host_thread(void *a) {
@@ -882,6 +935,7 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     // the save manager's requests (saves_android.c), before the host mounts the save: an import chosen in the menu or pushed by porter, an export porter asks for
     if (dm_saves_start(g_root)) { LOG("[saves] the request asked the app to end: the game is not started"); g_quit = 1; return; }
     settings_load(); dm_haptics_android_start(act, atomic_load(&g_set_rumble));
+    startup_loading_start();
     { pthread_t w; if (!pthread_create(&w, NULL, pad_watch, act->vm)) pthread_detach(w); }
     LOG("NX2A host on Android: files %s, saves %s", g_root, act->internalDataPath);
     pthread_t t; pthread_create(&t, NULL, input_thread, NULL); pthread_detach(t);

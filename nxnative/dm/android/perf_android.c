@@ -39,12 +39,24 @@ static struct {
 } H;
 static APerformanceHintSession *g_hint; static int64_t g_hint_target; static int32_t g_hint_tids[8]; static int g_hint_n;
 static AWorkDuration *g_wd;   // made once, its fields set for each frame's report
+static uint64_t g_activity_epoch;
+void dm_perf_activity_changed(void) { __atomic_fetch_add(&g_activity_epoch, 1, __ATOMIC_RELEASE); }
+// The long-work experiment shares the session with the present thread. Default reporting keeps
+// its original single-threaded path; the experiment serializes session membership and g_wd too.
+static pthread_mutex_t g_long_mu = PTHREAD_MUTEX_INITIALIZER;
+static unsigned g_hint_frames; static int64_t g_hint_scan_at;
+static int hint_long_enabled(void) { static int on = -1; if (on < 0) {
+    const char *e = getenv("DM_ADPF_LONG_WORK"), *a = getenv("DM_NVN_ASYNC"); on = e && !strcmp(e, "1") && !(a && atoi(a));
+    if (e && !strcmp(e, "1") && !on) LOG("[perf] long-work hints disabled with asynchronous replay: acquire and present are different work cycles");
+} return on; }
 
 static int64_t perf_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec; }
 
-// DM_GPU_TURBO=1 (live, read every 60 presents): Adreno's GPU at its highest clock (thermal limits still apply) through the KGSL property libadrenotools'
-// adrenotools_set_turbo sets: power control off on /dev/kgsl-3d0; 0 gives it back. A frame held at 30 fps lets the GPU governor lower the clock until the work
-// fills the frame, so its GPU time says little about what 60 would need. Any Vulkan driver on KGSL (Qualcomm's, Turnip)
+// DM_GPU_TURBO=1 (live, every 60 presents): a device-global KGSL profiling override, off by default.
+// Gen7 PWRCTRL=0 pauses GPU/bus devfreq, prevents GMU SLUMBER and requests pwrlevel 0 within thermal/max bounds; =1 restores governor control.
+// PJD110 / stock Adreno 750, 2026-11-05: two same-scene 1080p A/B/A trials gave ~14 -> 30 -> 14 fps and GPU ~53 -> 21 -> 53 ms.
+// This combines frequency, bandwidth and sleep changes; it does not isolate one mechanism or measure MHz. Restore explicitly with an independent guard:
+// the property is not owned by this process or its contexts, and abrupt process death need not restore it. Never enable as a production default.
 static void gpu_turbo(void) {
     static int on;   // what was last set
     const char *e = getenv("DM_GPU_TURBO"); int want = e && atoi(e) > 0;
@@ -54,7 +66,7 @@ static void gpu_turbo(void) {
     int fd = open("/dev/kgsl-3d0", O_RDWR); int r = fd < 0 ? -1 : ioctl(fd, _IOW(0x09, 0x32, prop), &prop);   // IOCTL_KGSL_SETPROPERTY
     if (fd >= 0) close(fd);
     if (r) { LOG("[RED] [perf] DM_GPU_TURBO=%d: the GPU's power control could not be set (%s)", want, strerror(errno)); return; }
-    on = want; LOG("[perf] DM_GPU_TURBO=%d: %s", want, want ? "the GPU at its highest clock (power control off)" : "the GPU's own clock control again");
+    on = want; LOG("[perf] DM_GPU_TURBO=%d: %s", want, want ? "KGSL power control off requested" : "the GPU's own clock control again");
 }
 
 static void hint_init(int64_t target) {
@@ -78,10 +90,10 @@ static void hint_init(int64_t target) {
     LOG("[perf] ADPF session %s (target %.2f ms, thread %d; GPU time %s, load increases %s)", g_hint ? "open" : "refused", target / 1e6, g_hint_tids[0],
         H.report2 ? "reported" : "not reported", H.increase ? "signalled" : "not signalled");
 }
-// The other threads that do frame work: the presenting thread is the game's render thread, and its main thread (the simulation) and job workers set
-// the pace as much. Every 300 frames the threads that used at least 15% of a core since the last look join the session (up to 5 besides the
-// presenting one), the ones that went idle leave it. Without them NEO's main thread ran on mid cores at 1.9 of 3.5 GHz and its bursts made
-// 45 to 80 ms frames. Needs APerformanceHint_setThreads (Android 14)
+// DM_ADPF_WORKERS=1: refresh at the next present after 0.5 s, selecting workers above 5% of a core.
+// DQB2 loading on Adreno 750 kept only the presenting thread in ADPF through its first 300 frames;
+// its busiest resource workers averaged 13-15%, below the old 15% cutoff. Default keeps the old policy for A/B.
+static int hint_workers(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_ADPF_WORKERS"); on = e && atoi(e) > 0; e = getenv("DM_PIN_GAME"); on |= e && atoi(e) > 0; on |= hint_long_enabled(); } return on; }
 static uint64_t task_ticks(int tid) {
     char p[64], b[512]; snprintf(p, sizeof p, "/proc/self/task/%d/stat", tid);
     FILE *f = fopen(p, "r"); if (!f) return 0;
@@ -91,30 +103,100 @@ static uint64_t task_ticks(int tid) {
     for (char *t = c + 1; *t && field < 15; t++) if (*t == ' ') { field++; if (field == 14) ut = strtoull(t + 1, NULL, 10); else if (field == 15) st = strtoull(t + 1, NULL, 10); }
     return ut + st;
 }
-static void hint_threads_scan(int32_t self) {
-    static struct { int tid; uint64_t ticks; } prev[512]; static int np; static int64_t last;
-    int64_t now = perf_now(); double secs = last ? (now - last) / 1e9 : 0; last = now;
-    DIR *d = opendir("/proc/self/task"); if (!d) return;
-    struct { int tid; uint64_t used; } cur[512]; int nc = 0; struct dirent *e;
-    while ((e = readdir(d)) && nc < 512) { int tid = atoi(e->d_name); if (tid <= 0) continue; cur[nc].tid = tid; cur[nc].used = task_ticks(tid); nc++; }
-    closedir(d);
-    int32_t pick[8]; int npick = 0; pick[npick++] = self;
-    if (secs > 0) {
-        long hz = sysconf(_SC_CLK_TCK); double need = 0.15 * secs * (double)(hz > 0 ? hz : 100);
-        for (int k = 0; k < 5; k++) {   // the busiest first
-            int best = -1; uint64_t bu = 0;
-            for (int i = 0; i < nc; i++) {
-                if (cur[i].tid == self) continue;
-                int taken = 0; for (int j = 0; j < npick; j++) taken |= pick[j] == cur[i].tid; if (taken) continue;
-                uint64_t was = 0; for (int j = 0; j < np; j++) if (prev[j].tid == cur[i].tid) { was = prev[j].ticks; break; }
-                uint64_t u = cur[i].used > was ? cur[i].used - was : 0;
-                if (was && u >= need && u > bu) { bu = u; best = i; }
-            }
-            if (best < 0) break;
-            pick[npick++] = cur[best].tid;
+typedef struct { int tid; uint64_t ticks; } hint_thread_sample;
+static int hint_scan_due(int workers, unsigned frames, int64_t now, int64_t last) {
+    return workers ? !last || now - last >= 500000000ll : frames % 300 == 0;
+}
+static int hint_pick_threads(int32_t self, const hint_thread_sample *cur, int nc, const hint_thread_sample *prev, int np,
+                             double need, int zero_ok, int32_t *pick) {
+    int n = 0; if (self > 0) pick[n++] = self;   // self=0: rank every thread, without a reserved presenter slot
+    for (int k = 0; k < 5; k++) {
+        int best = -1; uint64_t bu = 0;
+        for (int i = 0; i < nc; i++) {
+            int taken = 0; for (int j = 0; j < n; j++) taken |= pick[j] == cur[i].tid; if (taken) continue;
+            uint64_t was = 0; int found = 0;
+            for (int j = 0; j < np; j++) if (prev[j].tid == cur[i].tid) { was = prev[j].ticks; found = 1; break; }
+            uint64_t u = cur[i].ticks > was ? cur[i].ticks - was : 0;
+            // An observed worker can begin with zero ticks. Unknown workers need one sample interval first.
+            if (found && (zero_ok || was) && u >= need && u > bu) { bu = u; best = i; }
         }
+        if (best < 0) break;
+        pick[n++] = cur[best].tid;
     }
-    np = 0; for (int i = 0; i < nc; i++) { prev[np].tid = cur[i].tid; prev[np].ticks = cur[i].used; np++; }
+    return n;
+}
+// DM_PIN_GAME=1: an opt-in test of the two busiest threads on currently available CPU capacity.
+// Community #8/#11 and PJD110 loading: workers stayed on CPUs 2-6 despite ADPF enrollment. A startup
+// mask is insufficient; apply to actual workers after they exist, restoring their previous masks on rotation.
+static uint64_t hint_cpu_targets(const uint64_t *hw, const uint64_t *limit, const uint64_t *capacity, int n) {
+    int capacities = 1; for (int i = 0; i < n; i++) if (hw[i] && limit[i] && !capacity[i]) capacities = 0;
+    uint64_t best = 0, mask = 0;
+    for (int i = 0; i < n; i++) if (hw[i] && limit[i]) {
+        uint64_t lim = limit[i] < hw[i] ? limit[i] : hw[i];
+        uint64_t score = capacities ? capacity[i] * lim / hw[i] : lim;
+        if (score > best) { best = score; mask = 0; }
+        if (score && score == best) mask |= 1ull << i;
+    }
+    return mask;
+}
+// A single prime core must not serialize both critical threads. Give the second thread the next
+// capacity group; devices with several equally fast cores can share that group's mask.
+static void hint_cpu_pair(const uint64_t *hw, const uint64_t *limit, const uint64_t *capacity, int n, uint64_t masks[2]) {
+    masks[0] = hint_cpu_targets(hw, limit, capacity, n); masks[1] = masks[0];
+    if (masks[0] && !(masks[0] & (masks[0] - 1))) {
+        uint64_t rest[64]; for (int i = 0; i < n; i++) rest[i] = masks[0] >> i & 1 ? 0 : hw[i];
+        uint64_t next = hint_cpu_targets(rest, limit, capacity, n); if (next) masks[1] = next;
+    }
+}
+static uint64_t hint_cpu_read(int cpu, const char *name) {
+    char p[160]; snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%d/%s", cpu, name); FILE *f = fopen(p, "r");
+    unsigned long long v = 0; if (f) { if (fscanf(f, "%llu", &v) != 1) v = 0; fclose(f); } return v;
+}
+static void hint_pin_game(const hint_thread_sample *cur, int nc, const hint_thread_sample *prev, int np, double need) {
+    const char *e = getenv("DM_PIN_GAME"); if (!e || atoi(e) <= 0) return;
+    static int ncpu; static uint64_t hw[64], capacity[64]; uint64_t limit[64] = {0};
+    if (!ncpu) { long n = sysconf(_SC_NPROCESSORS_CONF); if (n <= 0 || n > 64) return; ncpu = (int)n;
+        for (int i = 0; i < ncpu; i++) { hw[i] = hint_cpu_read(i, "cpufreq/cpuinfo_max_freq"); capacity[i] = hint_cpu_read(i, "cpu_capacity"); } }
+    for (int i = 0; i < ncpu; i++) limit[i] = hint_cpu_read(i, "cpufreq/scaling_max_freq");
+    uint64_t masks[2]; hint_cpu_pair(hw, limit, capacity, ncpu, masks); if (!masks[0]) return;
+    int32_t rank[8]; int nr = hint_pick_threads(0, cur, nc, prev, np, need, 1, rank); if (nr > 2) nr = 2;
+    static struct { int tid; cpu_set_t saved; uint64_t mask; } held[2];
+    for (int i = 0; i < 2; i++) if (held[i].tid) {
+        int keep = 0; for (int j = 0; j < nr; j++) keep |= held[i].tid == rank[j];
+        if (!keep) { if (sched_setaffinity(held[i].tid, sizeof held[i].saved, &held[i].saved) && errno != ESRCH) {
+                static int warned; if (!warned++) LOG("[perf] restoring worker affinity refused (%s)", strerror(errno)); }
+            held[i].tid = 0; }
+    }
+    for (int j = 0; j < nr; j++) {
+        cpu_set_t set; CPU_ZERO(&set); for (int i = 0; i < ncpu; i++) if (masks[j] >> i & 1) CPU_SET(i, &set);
+        int at = -1, fresh = 1;
+        for (int i = 0; i < 2; i++) if (held[i].tid == rank[j]) { at = i; fresh = 0; break; }
+        if (at < 0) for (int i = 0; i < 2; i++) if (!held[i].tid) { at = i; break; }
+        if (at < 0) continue;
+        if (fresh && sched_getaffinity(rank[j], sizeof held[at].saved, &held[at].saved)) continue;
+        if (sched_setaffinity(rank[j], sizeof set, &set)) { static int warned; if (!warned++) LOG("[perf] worker affinity refused (%s)", strerror(errno)); continue; }
+        held[at].tid = rank[j]; held[at].mask = masks[j];
+    }
+    static uint64_t last_mask[2]; static int last_tid[2], changes;
+    if (held[0].mask != last_mask[0] || held[1].mask != last_mask[1] || held[0].tid != last_tid[0] || held[1].tid != last_tid[1]) {
+        if (changes++ < 40) LOG("[perf] worker CPU placement: thread %d mask %#llx, thread %d mask %#llx", held[0].tid, (unsigned long long)held[0].mask, held[1].tid, (unsigned long long)held[1].mask);
+        for (int i = 0; i < 2; i++) { last_mask[i] = held[i].mask; last_tid[i] = held[i].tid; }
+    }
+}
+static void hint_threads_scan(int32_t self) {
+    static hint_thread_sample prev[512]; static int np; static int64_t last;
+    int64_t now = perf_now(); double secs = last ? (now - last) / 1e9 : 0;
+    DIR *d = opendir("/proc/self/task"); if (!d) return;
+    hint_thread_sample cur[512]; int nc = 0; struct dirent *e;
+    while ((e = readdir(d)) && nc < 512) { int tid = atoi(e->d_name); if (tid <= 0) continue; cur[nc++] = (hint_thread_sample){tid, task_ticks(tid)}; }
+    closedir(d); last = now;
+    int32_t pick[8]; int npick = 1; pick[0] = self;
+    if (secs > 0) {
+        long hz = sysconf(_SC_CLK_TCK); double need = (hint_workers() ? 0.05 : 0.15) * secs * (double)(hz > 0 ? hz : 100);
+        npick = hint_pick_threads(self, cur, nc, prev, np, need, hint_workers(), pick);
+        hint_pin_game(cur, nc, prev, np, need);
+    }
+    np = nc; memcpy(prev, cur, sizeof *cur * (size_t)nc);
     if (!g_hint || !H.set_threads) return;
     int same = npick == g_hint_n; for (int i = 0; same && i < npick; i++) { int in = 0; for (int j = 0; j < g_hint_n; j++) in |= g_hint_tids[j] == pick[i]; same = in; }
     if (same) return;
@@ -138,6 +220,117 @@ void dm_perf_replay_thread(void) {
     for (long c = 0; c < n; c++) if (prime ? mhz[c] == hi : mhz[c] > lo) { CPU_SET(c, &set); o += snprintf(l + o, sizeof l - o, " %ld", c); }
     if (sched_setaffinity(0, sizeof set, &set)) { LOG("[perf] DM_PIN_REPLAY: sched_setaffinity refused"); return; }
     LOG("[perf] replay thread on CPUs%s (%s, up to %ld MHz)", l, prime ? "prime" : "big", hi);
+}
+
+// DM_ADPF_LONG_WORK=1 (start-up, experimental): a completed loading frame is still a real
+// work cycle. PJD110 loading had 1-4 s frames, all excluded by the ordinary 250 ms guard.
+// Do not invent short completed cycles or repeatedly send workload-increase hints: Android 16's
+// performance_hint.h reserves those for transitions, with duration reports for ongoing work.
+typedef struct { int32_t tid; uint64_t ns; } hint_cpu_sample;
+static uint64_t hint_cpu_delta(const hint_cpu_sample *prev, int np, const hint_cpu_sample *cur, int nc) {
+    uint64_t sum = 0;
+    for (int i = 0; i < nc; i++) for (int j = 0; j < np; j++) if (cur[i].tid == prev[j].tid) {
+        if (cur[i].ns >= prev[j].ns) { uint64_t d = cur[i].ns - prev[j].ns; if (UINT64_MAX - sum < d) return UINT64_MAX; sum += d; }
+        break;
+    }
+    return sum;   // unknown/joining threads start with a baseline, never their lifetime CPU time
+}
+static int hint_long_allowed(int64_t start, int64_t now, uint64_t epoch, uint64_t current, int active, uint64_t cpu) {
+    return start > 0 && now > start && now - start >= 250000000ll && epoch == current && active &&
+           cpu >= (uint64_t)(now - start) / 20;   // observed CPU progress, at least 5% of one core
+}
+static int hint_long_notify(int *episode, int allowed) {
+    if (!allowed || *episode) return 0;
+    *episode = 1; return 1;   // one attempt for a continuous expensive episode, including a refused hint
+}
+extern int dm_focus_now(void);
+extern int dm_menu_state(void); extern ANativeWindow *dm_front_window(void);
+static int hint_long_active(void) { return dm_focus_now() == 1 && dm_menu_state() < 0 && dm_front_window() && !dm_detclock_enabled(); }
+static struct {
+    int64_t start, last_long; uint64_t epoch, cpu;
+    int valid, episode; int32_t presenter;
+    hint_cpu_sample prev[8]; int np;
+} g_long;
+// Linux per-thread scheduler CPU clock, also used by bionic pthread_getcpuclockid:
+// (~tid << 3) | CPUCLOCK_PERTHREAD_MASK | CPUCLOCK_SCHED. Using the TID avoids
+// treating it as a pthread_t; no /proc I/O is added to every acquire/present.
+static int hint_cpu_time(int32_t tid, uint64_t *ns) {
+    if (tid <= 0) return 0;
+    struct timespec t; clockid_t c = (clockid_t)(((~(uint32_t)tid) << 3) | 6u);
+    if (clock_gettime(c, &t) || t.tv_sec < 0 || t.tv_nsec < 0 || t.tv_nsec >= 1000000000 ||
+        (uint64_t)t.tv_sec > (UINT64_MAX - (uint64_t)t.tv_nsec) / 1000000000ull) return 0;
+    *ns = (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec; return 1;
+}
+static int hint_session_cpu_read(hint_cpu_sample *out) {   // g_long_mu held: exactly the session's current TIDs
+    for (int i = 0; i < g_hint_n; i++) {
+        uint64_t ns; if (!hint_cpu_time(g_hint_tids[i], &ns)) return -1;
+        out[i] = (hint_cpu_sample){g_hint_tids[i], ns};
+    }
+    return g_hint_n;
+}
+static void hint_long_cpu(void) {
+    hint_cpu_sample cur[8]; int n = hint_session_cpu_read(cur);
+    if (n < 0) { g_long.valid = 0; g_long.np = 0; return; }
+    uint64_t d = hint_cpu_delta(g_long.prev, g_long.np, cur, n);
+    if (d == UINT64_MAX || UINT64_MAX - g_long.cpu < d) { g_long.valid = 0; return; }
+    g_long.cpu += d;
+    memcpy(g_long.prev, cur, sizeof *cur * (size_t)n); g_long.np = n;
+}
+static int hint_long_valid(void) {
+    if (g_long.epoch != __atomic_load_n(&g_activity_epoch, __ATOMIC_ACQUIRE) || !hint_long_active()) g_long.valid = 0;
+    return g_long.valid;
+}
+static void hint_long_begin(int64_t now) {
+    pthread_mutex_lock(&g_long_mu);
+    g_long.start = now; g_long.epoch = __atomic_load_n(&g_activity_epoch, __ATOMIC_ACQUIRE);
+    g_long.valid = hint_long_active(); g_long.presenter = (int32_t)gettid(); g_long.cpu = 0;
+    g_long.np = hint_session_cpu_read(g_long.prev); if (g_long.np < 0) { g_long.np = 0; g_long.valid = 0; }
+    pthread_mutex_unlock(&g_long_mu);
+}
+static void hint_long_end(int64_t now) {   // g_long_mu held; a real frame completed, not a watchdog interval
+    if (!g_long.start) return;
+    hint_long_cpu();
+    int active = hint_long_valid();
+    int allowed = hint_long_allowed(g_long.start, now, g_long.epoch, __atomic_load_n(&g_activity_epoch, __ATOMIC_ACQUIRE), active, g_long.cpu);
+    if (now - g_long.start >= 250000000ll) {
+        g_long.last_long = now;
+        if (allowed && g_hint && H.report2 && g_long.cpu <= INT64_MAX) {
+            H.wd_start(g_wd, g_long.start); H.wd_total(g_wd, now - g_long.start);
+            H.wd_cpu(g_wd, (int64_t)g_long.cpu); H.wd_gpu(g_wd, 0);   // current frame GPU time is not measured yet
+            int r = H.report2(g_hint, g_wd);   // no legacy fallback: blocked wall time is not measured CPU execution
+            static int n; if (n++ < 4) LOG("[perf] long work: %.1f ms total, %.1f ms observed session CPU, GPU unmeasured; ADPF report %s",
+                (now - g_long.start) / 1e6, g_long.cpu / 1e6, r ? "refused" : "accepted");
+        }
+    } else if (now - g_long.last_long >= 1000000000ll) g_long.episode = 0;   // a second of ordinary frames ends the episode
+    if (!active) g_long.episode = 0;
+    g_long.start = 0;
+}
+static void *hint_long_watch(void *arg) {
+    (void)arg; pthread_setname_np(pthread_self(), "dm-adpf-work");
+    for (;;) {
+        struct timespec pause = {0, 250000000}; nanosleep(&pause, NULL);
+        pthread_mutex_lock(&g_long_mu);
+        int64_t now = perf_now();
+        if (g_hint && g_long.start && now - g_long.start >= 250000000ll && hint_long_valid()) {
+            hint_long_cpu();
+            if (hint_scan_due(1, g_hint_frames, now, g_hint_scan_at)) {
+                g_hint_scan_at = now; hint_threads_scan(g_long.presenter);
+                g_long.np = hint_session_cpu_read(g_long.prev);   // changed membership: baseline before crediting CPU time
+                if (g_long.np < 0) { g_long.np = 0; g_long.valid = 0; }
+            }
+            int allowed = hint_long_allowed(g_long.start, now, g_long.epoch, __atomic_load_n(&g_activity_epoch, __ATOMIC_ACQUIRE), hint_long_valid(), g_long.cpu);
+            if (H.increase && hint_long_notify(&g_long.episode, allowed)) {
+                int r = H.increase(g_hint, true, false, "active long CPU work");
+                LOG("[perf] long work CPU transition %s; subsequent work uses completed-cycle reports", r ? "refused" : "requested");
+            }
+        }
+        pthread_mutex_unlock(&g_long_mu);
+    }
+    return NULL;
+}
+static void hint_long_start(void) {
+    pthread_t t; if (pthread_create(&t, NULL, hint_long_watch, NULL)) { LOG("[perf] long-work watcher unavailable"); return; }
+    pthread_detach(t);
 }
 
 static int64_t g_work_start;
@@ -254,9 +447,9 @@ static void adapt_frame(int64_t work, int64_t now) {
 // left out, Super Mario Odyssey's hint saw light frames and the clocks stayed at 1-2 GHz). At 60 fps it is not a pace but the display or the swapchain
 // holding the frames back, and it stays in the work, or the rate could not step down for it
 static int64_t g_prev_present, g_pace, g_pq;
-void dm_perf_frame_start(uint64_t pace_ns, uint64_t pq_ns) { g_work_start = perf_now(); g_pace = (int64_t)pace_ns; g_pq = (int64_t)pq_ns; }
+void dm_perf_frame_start(uint64_t pace_ns, uint64_t pq_ns) { g_work_start = perf_now(); g_pace = (int64_t)pace_ns; g_pq = (int64_t)pq_ns; if (hint_long_enabled()) hint_long_begin(g_work_start); }
 // Called on the presenting thread right before a present; period in seconds (1/60, 1/30, ...).
-void dm_perf_frame(double period) {
+static void perf_frame(double period) {
     int64_t p = period > 0 && period < 1 ? (int64_t)(period * 1e9) : 16666667, t = perf_now();
     // the CPU hint's target is the game's own period, not the adaptive one: with the longer target the CPU clocks drop until the work fills it,
     // and the work then never shows the room to step back up (NEO stayed at 30 fps with frames of 31 to 48 ms)
@@ -270,9 +463,17 @@ void dm_perf_frame(double period) {
         g_work_start = 0;
     }
     g_prev_present = t;
-    static unsigned frames; if (frames++ % 300 == 0) hint_threads_scan((int32_t)gettid());
+    if (hint_scan_due(hint_workers(), g_hint_frames++, t, g_hint_scan_at)) { g_hint_scan_at = t; hint_threads_scan((int32_t)gettid()); }
     if (!g_hint) return;
     if (p != g_hint_target && H.update) { H.update(g_hint, p); g_hint_target = p; }
+}
+
+void dm_perf_frame(double period) {
+    if (!hint_long_enabled()) { perf_frame(period); return; }
+    pthread_mutex_lock(&g_long_mu);
+    hint_long_end(perf_now()); perf_frame(period);
+    pthread_mutex_unlock(&g_long_mu);
+    static pthread_once_t once = PTHREAD_ONCE_INIT; if (g_hint) pthread_once(&once, hint_long_start);
 }
 
 // The window's frame rate: the game's rate, so the display can pick a mode it divides (60 / 120 Hz rather than 144 Hz for a 60 fps game).

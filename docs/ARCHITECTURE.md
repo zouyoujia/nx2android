@@ -73,6 +73,239 @@ both extraction roles, with NCAs selected by the corresponding content metadata.
 
 RomFS in the data pack is hard-linked to the extraction when the volume allows it, so it takes no extra space.
 
+Android memory pools normally import an AHardwareBuffer for zero-copy GPU access.
+`DM_VK_ZEROCOPY_MIN_KB=<n>` optionally routes whole NVN pools smaller than n KiB
+through the existing copied-pool path, avoiding hardware-buffer allocation and remapping
+for frequently recreated small pools. The default is 0 (unchanged zero-copy policy).
+The threshold is based on the whole pool, so a small final chunk of a large pool stays zero-copy.
+`DM_VK_ZEROCOPY_MAX_MB` and `DM_VK_NO_ZEROCOPY` keep their existing precedence.
+
+The opt-in `DM_GPU_TURBO` switch is a device-global KGSL profiling override,
+not an app-owned performance session. On Gen7 it pauses GPU/bus devfreq, blocks
+GMU SLUMBER and requests the highest allowed power level; thermal/max bounds
+still apply. Tests require independent restoration because process death need
+not release the property. Keep it off by default; a production performance
+request should have verified context/session ownership and lifecycle cleanup.
+
+`porter port --gpu-perf` is an experimental opt-in that packages the context hook
+and writes `DM_GPU_PERF=1`. It keeps the system Vulkan driver unless a custom
+driver was separately requested. The optional loader observes the driver's own
+KGSL context creation and requests an existing maximum performance level on
+the same fd; no global power-control property is used. Default loading is
+unchanged. `DM_GPU_PERF=2` is a diagnostic control: the same isolated stock
+loader and hook, with context requests disabled. Compare 2 versus 1 before
+attributing improvements to the request. Process-lifetime hook counters
+distinguish interception, accepted flags and accepted property requests;
+acceptance is not hardware activation. Context destruction clears its owned
+constraint, while idle expiry and actual frequency remain governed by the
+kernel. Device validation of interception, active performance and cleanup is
+required before this option can become a tested recommendation.
+
+`DM_VK_CPU_SMALL_UPLOADS` is a default-off bounded-copy experiment. Mode 2
+only counts metadata eligibility and preserves the ordinary GPU submission;
+mode 1 copies eligible data synchronously after all prior GPU work is complete.
+It accepts only a single exact copy record with no event/fence operations,
+a tiny copied CPU-uncached source and a zero-copy destination whose actual
+Vulkan memory type is HOST_VISIBLE and HOST_COHERENT. In either diagnostic
+mode, AHB imports prefer such a compatible type; mode 0 keeps the usual type
+selection. Any intersecting pool alias, including a partial alias, rejects the
+host path. Backend submission ownership covers inspection and copying; queue
+ownership also excludes presentation work, with one idle wait per changed queue
+epoch. Mode 1 maps the Vulkan allocation once and writes through its returned
+persistent mapping. Missing memory properties or a mapping failure retains the
+GPU path. Host-write preparation preserves dirty tracking; no GPU fence is
+invented for a completed CPU copy. Per-copy AHardwareBuffer lock/unlock was
+rejected after device measurement showed whole-allocation synchronization cost.
+Android `DM_THREAD_WAIT_PROF=1` separately exposes bounded yield/back-off
+summaries even without Mach power counters.
+
+`DM_VK_LAZY_SMALL_POOLS=1` is a separate default-off experiment alongside CPU
+small copies. Physical NVN pool registration supplies flags with its metadata;
+the other backends use a weak wrapper preserving the previous add/set-flags
+sequence. Only known CPU-uncached whole pools below 64 KiB that selected the
+configured small-pool copied path can remain metadata-only. Sparse virtual
+mappings, other pool kinds and actual AHB import failures remain eager.
+Candidate registration shares backend submission ownership, so no worker can
+publish a new lazy pool after a submission's preparation pass. Every real
+submission materializes all live lazy pools before replay, releases the pool
+lock, then retains the original completion wait and complete initial snapshot.
+Direct UBO/SSBO access therefore still sees valid buffers. CPU-only retirement
+keeps dirty/alias bookkeeping but skips Vulkan destruction and fence waits.
+`DM_VK_POOL_PROF=1` counts registrations, allocations, materialization and
+metadata-only retirements. NVN timing summaries include an absolute host
+monotonic timestamp for precise same-checkpoint comparisons.
+
+`DM_VK_PASS_CENSUS=1` observes pass closures without changing rendering commands.
+The Android replay records closure reasons, zero/one/multiple draws, barrier mask
+counts, render-target comparison results and actual LRZ transfer categories.
+A short mutex protects counter updates/snapshots; bounded logs are emitted after
+releasing it every 600 presents. These counts identify candidates for a later
+barrier change and are not permission to remove synchronization or LRZ handling.
+
+`DM_VK_GPU_SEGMENTS=1` creates a separate timestamp pool at startup, without
+sampling until `DM_VK_GPU_SAMPLES=N` requests up to eight frames. A request skips
+the partly replayed current frame, captures every submission of selected frames
+30 presents apart, then stops; a hard 64-submission limit explicitly marks a
+truncated frame. Each submission can record 4,096 exclusive intervals across up
+to 32 main command-buffer parts. Bottom-of-pipe markers bracket render passes
+(including begin/end load/store work), LRZ reads/writebacks, standalone global
+barriers and compute work including its barriers. Nested barriers belong to the
+outer LRZ/compute interval. Upload-command-buffer barriers are counted separately
+and are not attributed to main-buffer intervals. These are completion intervals,
+not utilization or isolated ALU costs; timestamps themselves can disturb binning.
+Part begin/end markers expose elapsed gaps between early-submitted parts without
+assuming those gaps are CPU stalls. Unclassified time remains explicit.
+
+Only actually written queries are read, without `WAIT_BIT`, after the existing
+final fence and before slot reuse; refused submissions discard the capture.
+Private metadata/results survive slot reuse. Summary logs and `gpu_segments.tsv`
+are emitted by the completion worker after publishing game/slot completion.
+Missing endpoints, unavailable queries, ambiguous counter wraps, overlapping
+intervals and exhausted capacities are reported instead of silently attributed.
+Sampling off adds no GPU timestamp/reset commands, barriers or waits. Compare
+sampled frames with nearby unsampled controls before treating the breakdown as a
+normal frame cost. Tests execute the production planner, reducer and query hooks.
+
+Vulkan replay treats `OP_BARRIER` with an empty bit mask as a no-op, matching
+the Metal replay: it requests no ordering or cache invalidation. The recorder
+carries only that mask and padding. It must preserve an active or pending-clear
+pass, bound state and deferred updates. Nonzero masks retain the full pass-end
+and global-barrier path, including unknown bits.
+`DM_VK_SKIP_EMPTY_BARRIER=0` restores the old behavior for live comparison;
+census still records empty calls but counts no actual closure when skipped.
+PJD110 stock-driver DQB2, docked 1080p, same-process dialogue A/B/A:
+empty-mask handling off/on/off gave 54.284/33.334/55.232 ms per frame
+(18.42/30.00/18.11 FPS). The clean on window retained 329,400 empty calls
+over 600 frames with zero closures; total passes fell from 534 to 154.59 per
+frame, with draws/dispatches preserved. GPU submission span fell from 45.17
+to 27.03 ms; these timestamps are not occupancy or clock-frequency counters.
+This validates the local semantic fix, not a claim of full device utilization.
+
+`DM_VK_DEDUP_ADJ_BARRIER=1` is an opt-in experiment for literal adjacent
+nonzero barrier records in one replay block and one command buffer. The first
+full barrier and all pass boundaries remain; only a following identical-scope
+full barrier with no intervening record/GPU work may be omitted. Zero masks,
+other records (including calls/jumps), block boundaries and command-buffer changes
+break adjacency. Pass census reports candidates and actual omissions separately.
+It does not establish that other nonzero barriers are redundant.
+
+`DM_VK_TEXTURE_BARRIER` is a default-off, per-submission experiment for exact
+`0x10` texture invalidation: 0 keeps the original path, 1 observes metadata while
+retaining all original rendering commands, and 2 defers the pass end/full barrier.
+It requires an active, drawn pass whose previous draws have no potential storage,
+transform-feedback, raster-discard or unknown writes. Only direct sampled-texture
+bindings and known uniform resources are initially supported. All other masks,
+mixed masks, pending clears and unknown sources keep the original path.
+
+A pending dependency snapshots all attachment storage footprints and persists
+across every later draw, state change, call/jump and descriptor memo hit. Metadata
+preflight uses the same versioned texture registrations without creating views or
+recording uploads. Pool-relative aliases and overlapping CPU address ranges both
+count; whole footprints conservatively include all mip/layer views. Virtual,
+sparse, linear, fresh, dirty, unregistered, mismatched or mutually aliased sources
+are rejected. Uniform checks include descriptor alignment prefixes. Vertex reads
+initially reject the whole Vulkan backing buffer, covering indexed fetches beyond
+the NVN bound; indirect and unresolved resources fall back. Deferred handle reads,
+copies, uniform updates, clears, counters, transform feedback, dispatches and
+unknown records flush before execution. Natural pass ends and the 128-draw cap
+also discharge pending synchronization. No draw or shader work is dropped.
+
+Registration/view-drop generation publication is atomic. A descriptor cache stores
+the generation taken before lookup, so a racing rewrite cannot mark an older
+view current. The guard checks texture/pool/dirty/upload generations before reads
+and again after actual descriptor collection; a change ends/synchronizes the pass
+and retries preparation before counting or emitting the draw. Observational mode
+may end a hypothetical window sooner at an actual `SetRenderTargets`; its candidate
+counts are not a proof that an entire interval can be merged. Cumulative reports
+separate candidates, actual deferrals and fallback reasons. Device correctness and
+same-scene performance comparisons are required before enabling a profile default.
+Guarded mode conservatively re-emits binding and dynamic state for every draw;
+pipeline and descriptor object caches remain active. This retains the command
+path used for device validation after intermittent missing menu glyphs; the
+precise cause of that transient remains unconfirmed. Legacy/observational modes
+retain their state suppression. Adjacent barriers with no active physical pass
+must not clear an observational window before a later dependent draw.
+
+On PJD110/stock Adreno 750, the docked outdoor menu was compared off/on/off in one
+process at the same 1920x1080 resolution, with complete state rebinding in all
+three phases. Checkpoint windows measured 18.96/30.00/17.30 FPS. Separate one-frame
+structural samples had 346/52/346 passes, with 1,024 draws and two dispatches in
+each. The window CPU replay means were 21.36/8.87/22.51 ms. Screenshots retained
+the menu text in all phases. These results justify this profile's opt-in default;
+they do not establish correctness through sustained game progression or an FPS
+floor in other scenes. Raw logs/screenshots remain in the ignored game folder.
+
+Compute prewarm keeps the base-shader path and optionally warms exact integer-view
+variants observed in successful real dispatches (`DM_VK_COMPUTE_WARM_SEEN=1`,
+startup, default off). A bounded 256-entry list stores {shader, unsigned mask,
+signed mask} in `vk_compute_pipelines.bin` (CMW1/version 1, fixed little-endian
+header and 24-byte records). Invalid files, unknown compute shaders, overlapping
+masks and non-variantable bindings are ignored. Replay records metadata only;
+the existing background/drain pipeline-cache save path persists a short snapshot
+with serialized atomic file replacement and retry after errors. The background
+warm thread compiles exact keys after base prewarm, outside map locks; failed
+prewarm does not publish a failure sentinel, so a required dispatch keeps its
+original synchronous fallback. No compute work is skipped for asynchronous
+readiness. Creation longer than 50 ms records its shader/masks/time even with
+slow-replay profiling off. First-ever unseen variants may still compile on use.
+
+The NVN timing wrapper is a development cost, not rendering semantics.
+`DM_NVN_PROF=0` now disables it at startup or through a development env command.
+Targets are snapshotted after registration and remain immutable; live changes
+publish atomic slot pointers, preserving the 16-byte table / byte-8 target ABI
+and in-flight wrapper calls. A live choice wins over later proc lookups.
+The optional `DM_NVN_SEQ` request and `DM_SLEEP_BT` range are initialized once;
+development env notifications publish updated configuration. Disabled wait/trace
+paths do not scan the environment. SyncWait retains its query/result semantics
+but reads elapsed diagnostic time only while tracing is enabled. Startup absence
+keeps normal execution free of full NVN timing wrappers.
+
+Vulkan zero-timeout completion queries use acquire reads of the published game
+or slot-ready watermark. They take no condition mutex, read no wall clock and
+never enter a condition wait. Positive waits retain their existing deadline
+semantics. `DM_VK_POLL_FAST=0` restores the old expired-wait path only for a
+controlled comparison. Query reports separate zero/positive calls and actual
+condition-wait costs; less waiting is not by itself proof of faster frames.
+Development DM_CTL env commands notify weak NVN, thread-debug and backend hooks
+after setenv; the Android backend atomically publishes completion-test flags. Each retirement
+snapshots the early-completion mode, so switching during reset cannot suppress
+completion. Release apps still unset DM_CTL and accept no remote key input.
+
+Vulkan host completion has two ordered watermarks: game-visible completion
+requires GPU execution, copied-pool writeback, query reads and event/counter
+writes; slot readiness additionally requires command-buffer reset. Submission
+slots always wait for readiness before reuse, including the no-prereset path.
+The opt-in `DM_VK_EARLY_COMPLETE=1` publishes game completion before reset so
+CPU game work may overlap that bookkeeping; default publication remains after
+reset. Host drain waits for both. The sync profile reports slot reuse waits
+separately. This preserves six-slot lifetime and query ownership; local ordering
+tests do not establish a physical-device improvement.
+
+`DM_ADPF_LONG_WORK=1` optionally extends performance reporting to completed
+synchronous-replay work cycles of at least 250 ms, which ordinary frame reporting
+excludes. It measures the hint session threads' scheduler CPU clocks, reports
+no unmeasured GPU duration, and skips unsupported or incomplete measurements.
+A low-frequency observer can refresh worker membership during an open long
+cycle and attempt one CPU workload-increase notification per episode; completed
+cycles carry ongoing duration reports. A frontend activity epoch rejects work
+crossing a pause, menu, keyboard or focus change; headless and deterministic
+clock runs are excluded. Async NVN replay is excluded because acquire and
+present do not delimit the same work cycle there. This is off by default and
+makes no claim of overriding a platform frequency limit.
+
+Android CPU performance requests are handled by `android/perf_android.c`.
+`DM_ADPF_WORKERS=1` opts into wall-time-based busy-worker enrollment (at the next
+present after 0.5 s, above 5% of a CPU), retaining the existing 300-present / 15%
+policy by default. `DM_PIN_GAME=1` also enables this scan and explicitly places
+the two busiest threads using CPU capacity scaled by the current frequency cap
+(or current capped frequency when capacity metadata is incomplete). With one
+fastest core, the second thread uses the next capacity group; with several,
+both can use that group. The scanner restores the original affinity of workers
+that leave the selected pair. Both switches are off by default, request no
+system-wide power change, and do not bypass thermal limits. Missing metadata or
+denied affinity requests preserve the system's normal scheduling. The approach
+is informed by [the source project's CPU-placement reports](https://github.com/shirai91/nx2android/issues/11).
+
 Subgroup instructions inside helper functions are inlined with the NDK's `spirv-opt`
 before shader reflection and packaging (`dm/android/tools/spirv_portable.py`). Adreno 750
 crashes while compiling an otherwise valid subgroup shuffle in a called function;

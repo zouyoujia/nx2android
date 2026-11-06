@@ -40,9 +40,10 @@
 #include <mach-o/ldsyms.h>
 
 // ---------- Slot table, thunks, unimplemented stubs ----------
-typedef struct { _Atomic uint64_t cnt; void *fn; } nvn_slot_t;
+typedef struct { _Atomic uint64_t cnt; _Atomic(void *) fn; } nvn_slot_t;
 nvn_slot_t nvn_slot[NVN_NFUNC];                 // The thunk accesses it by i*16; the layout must not change
 _Static_assert(sizeof(nvn_slot_t) == 16, "the trampolines are addressed in 16-byte steps");
+_Static_assert(__builtin_offsetof(nvn_slot_t, fn) == 8, "the thunk target stays at byte 8");
 extern void *nvn_thunk[NVN_NFUNC];
 extern const char *nvn_names[NVN_NFUNC];
 extern void nvn_unimpl_entry(void);
@@ -52,7 +53,8 @@ void *nvn_big_real[NVN_NFUNC];            // the real implementation of function
 void *nvn_real[NVN_NFUNC];               // DM_NVN_PROF: the real implementation called by the timing wrapper
 _Atomic uint64_t nvn_prof_ticks[NVN_NFUNC]; // DM_NVN_PROF: cumulative time of each function (cntvct counts)
 static uint8_t g_unimpl_seen[NVN_NFUNC];
-static int g_nvn_prof;                    // DM_NVN_PROF wrappers installed (nvn_init_slots)
+static _Atomic int g_nvn_prof;            // DM_NVN_PROF timing currently enabled
+static pthread_mutex_t g_nvn_prof_mu = PTHREAD_MUTEX_INITIALIZER; static int g_nvn_prof_ready, g_nvn_prof_live;
 
 uint64_t nvn_unimpl_c(nvn_slot_t *slot, uint64_t x0, uint64_t x1, uint64_t x2) {
     unsigned i = (unsigned)(slot - nvn_slot);
@@ -93,14 +95,37 @@ static void nvn_init_slots(void) {
     g_nsem = hit;
 }
 
-// DM_NVN_PROF=1: implemented functions (except unimplemented stubs and present: present includes the display-link wait and is counted separately) get a timing wrapper, used to
-// break down the time spent in the "translation layer recording phase". Tried at the constructor and again at the first name lookup: on Android env.txt is read after the
-// constructors run, so only the lookup (the game resolving its NVN procs) sees it
+// Profiling is optional: PJD110 gameplay made ~20,000 NVN calls/frame, each
+// wrapped in two clock reads. Snapshot targets after registration, then switch
+// only aligned slot pointers; in-flight wrappers keep their immutable target.
+static void nvn_prof_prepare(void) {
+    pthread_mutex_lock(&g_nvn_prof_mu);
+    if (!g_nvn_prof_ready) {
+        for (unsigned i = 0; i < NVN_NFUNC; i++) {
+            void *fn = atomic_load_explicit(&nvn_slot[i].fn, memory_order_relaxed);
+            if (fn != (void *)nvn_unimpl_entry && strcmp(nvn_names[i], "nvnQueuePresentTexture")) nvn_real[i] = fn;
+        }
+        g_nvn_prof_ready = 1;
+    }
+    pthread_mutex_unlock(&g_nvn_prof_mu);
+}
+static void nvn_prof_set(int on, int live) {
+    pthread_mutex_lock(&g_nvn_prof_mu);
+    if (live) g_nvn_prof_live = 1;   // a later proc lookup must not undo a live choice
+    if (g_nvn_prof_ready && (live || !g_nvn_prof_live) && atomic_load_explicit(&g_nvn_prof, memory_order_relaxed) != !!on) {
+        for (unsigned i = 0; i < NVN_NFUNC; i++) if (nvn_real[i])
+            atomic_store_explicit(&nvn_slot[i].fn, on ? (void *)nvn_prof_entry : nvn_real[i], memory_order_release);
+        atomic_store_explicit(&g_nvn_prof, !!on, memory_order_release);
+    }
+    pthread_mutex_unlock(&g_nvn_prof_mu);
+}
+// Constructors precede Android env.txt. The first lookup retries the startup
+// switch; explicit zero disables it. Real targets are ready before app threads.
 static void nvn_prof_install(void) {
-    if (g_nvn_prof || !getenv("DM_NVN_PROF")) return; g_nvn_prof = 1;
-    for (unsigned i = 0; i < NVN_NFUNC; i++)
-        if (nvn_slot[i].fn != (void *)nvn_unimpl_entry && strcmp(nvn_names[i], "nvnQueuePresentTexture")) { nvn_real[i] = nvn_slot[i].fn; nvn_slot[i].fn = (void *)nvn_prof_entry; }
-    LOG("[nvn] DM_NVN_PROF: timing wrappers on every implemented function");
+    nvn_prof_prepare();
+    const char *e = getenv("DM_NVN_PROF"); int on = e && atoi(e) != 0;
+    if (atomic_load_explicit(&g_nvn_prof, memory_order_acquire) == on) return;
+    nvn_prof_set(on, 0); if (on && atomic_load(&g_nvn_prof)) LOG("[nvn] DM_NVN_PROF: timing wrappers on every implemented function");
 }
 static void *nvn_lookup(const char *name) {
     nvn_init_slots(); nvn_prof_install();
@@ -208,12 +233,13 @@ static uint8_t *vpool_reserve(const pool_t *o); static void vpool_release(const 
 static void replay_lock(void); static void replay_unlock(void);   // the replay's state, from a game thread (see "Asynchronous replay")
 static void nvn_drain(void);
 __attribute__((weak)) void vk_pool_set_flags(const void *mem, int flags) { (void)mem; (void)flags; }
+__attribute__((weak)) void mtl_pool_add_flags(const void *mem, uint64_t size, int flags) { mtl_pool_add(mem, size); vk_pool_set_flags(mem, flags); }   // Android registers flags atomically with optional lazy backing
 __attribute__((weak)) void dm_perf_replay_thread(void) {}   // Android (perf_android.c): the replay thread's CPU placement   // Android's Vulkan host (gfx_vk_core.c): copied pools by their flags
 NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBuilder *b) {
     const pool_builder_t *s = (const pool_builder_t *)b; pool_t *o = (pool_t *)p;
     o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size;
     if (!o->mem && (o->flags & 0x200)) { uint8_t *vr = vpool_reserve(o); if (vr) o->mem = vr; }   // a sparse virtual pool's own address range (see MapVirtual)
-    else if (o->mem) { replay_lock(); mtl_pool_add(o->mem, o->size); vk_pool_set_flags(o->mem, o->flags); replay_unlock(); nvn_dirty_add_range(o->mem, o->size); }
+    else if (o->mem) { replay_lock(); mtl_pool_add_flags(o->mem, o->size, o->flags); replay_unlock(); nvn_dirty_add_range(o->mem, o->size); }
     if (!o->mem && !(o->flags & 0x200)) LOG("[RED] MemoryPoolInitialize: non-virtual pool has no storage flags=%#x size=%#llx", o->flags, o->size);
     if (getenv("DM_NVN_VLOG")) { LOG("[nvn] MemoryPool %p mem=%p size=%#llx flags=%#x", (void *)p, (void *)o->mem, (unsigned long long)o->size, o->flags); void dm_backtrace(uint64_t fp); dm_backtrace((uint64_t)__builtin_frame_address(0)); }
     OLOG("MemoryPool %p mem=%p size=%#llx flags=%#x", (void *)p, (void *)o->mem, o->size, o->flags);
@@ -650,10 +676,24 @@ NVN(nvnSyncFinalize, void, NVNsync *s) { ((sync_t *)s)->magic = 0; }
 NVN(nvnSyncSetDebugLabel, void, NVNsync *s, const char *l) { (void)s; (void)l; }
 // Fence = "all commands previously submitted to the queue have completed": record the fence value of the most recent submit
 static uint64_t nvn_fence_now(void); static int nvn_fence_wait(uint64_t f, uint64_t timeout_ns);
-static uint64_t g_frame;
+static _Atomic uint64_t g_frame;
 // DM_NVN_SEQ=N (live, a DM_CTL env line): the next N frames' submissions, fences, acquires, sync waits and presents in order, with thread and time
 // (how Xenoblade Chronicles 3's render thread was found waiting in SyncWait on the acquire sync for its whole frame's GPU work)
-static int seq_on(void) { static uint64_t until; const char *e = getenv("DM_NVN_SEQ"); if (e && atoi(e)) { until = g_frame + (uint64_t)atoi(e); setenv("DM_NVN_SEQ", "0", 1); } return g_frame < until; }
+static pthread_once_t g_seq_once = PTHREAD_ONCE_INIT;
+static _Atomic int g_seq_request; static _Atomic uint64_t g_seq_until;
+static void seq_init(void) { const char *e = getenv("DM_NVN_SEQ"); int n = e ? atoi(e) : 0; atomic_store(&g_seq_request, n > 0 ? n : 0); }
+static int seq_on(void) {
+    pthread_once(&g_seq_once, seq_init);
+    int n = atomic_load_explicit(&g_seq_request, memory_order_acquire);
+    if (n > 0 && atomic_compare_exchange_strong_explicit(&g_seq_request, &n, 0, memory_order_acq_rel, memory_order_acquire))
+        atomic_store_explicit(&g_seq_until, atomic_load_explicit(&g_frame, memory_order_relaxed) + (uint64_t)n, memory_order_release);
+    return atomic_load_explicit(&g_frame, memory_order_relaxed) < atomic_load_explicit(&g_seq_until, memory_order_acquire);
+}
+void dm_nvn_runtime_env_changed(const char *name, const char *value) {
+    if (!name || !value) return;
+    if (!strcmp(name, "DM_NVN_PROF")) { nvn_prof_set(atoi(value) != 0, 1); LOG("[nvn] runtime timing wrappers %s", atomic_load(&g_nvn_prof) ? "on" : "off"); }
+    else if (!strcmp(name, "DM_NVN_SEQ")) { pthread_once(&g_seq_once, seq_init); int n = atoi(value); atomic_store_explicit(&g_seq_request, n > 0 ? n : 0, memory_order_release); }
+}
 #define SEQ(...) do { if (seq_on()) { char sb_[256]; snprintf(sb_, sizeof sb_, __VA_ARGS__); LOG("[seq] f%llu t%lx %.3f %s", (unsigned long long)g_frame, (unsigned long)(uintptr_t)pthread_self(), now_ns() / 1e6, sb_); } } while (0)
 NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) { (void)q; (void)c; (void)f; ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = nvn_fence_now(); SEQ("fence %p", (void *)s); }
 // A sync object that was never fenced waits until timeout, as on a real device; a fenced one is released only after the GPU has actually completed up to that fence value
@@ -663,11 +703,13 @@ NVN(nvnQueueWaitSync, NVNboolean, NVNqueue *q, const NVNsync *s) { (void)q; stat
 NVN(nvnCommandBufferRestoreZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a, size_t n) { (void)c; (void)a; (void)n; }
 NVN(nvnCommandBufferSaveZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a, size_t n) { (void)c; (void)a; (void)n; }
 NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
-    const sync_t *o = (const sync_t *)s;
-    if (!o->fenced) { SEQ("syncwait %p unfenced", (void *)s); return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED; }
-    if (nvn_fence_wait(o->fence, 0)) { SEQ("syncwait %p kind %u already", (void *)s, o->fenced); return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED; }
-    uint64_t t0 = now_ns(); int r = nvn_fence_wait(o->fence, timeout);
-    SEQ("syncwait %p kind %u timeout %llu waited %.2f ms -> %d", (void *)s, o->fenced, (unsigned long long)timeout, (now_ns() - t0) / 1e6, r);
+    const sync_t *o = (const sync_t *)s; int trace = seq_on();
+    if (!o->fenced) { if (trace) SEQ("syncwait %p unfenced", (void *)s); return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED; }
+    if (nvn_fence_wait(o->fence, 0)) { if (trace) SEQ("syncwait %p kind %u already", (void *)s, o->fenced); return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED; }
+    // Keep both queries and result-code races unchanged; elapsed time is only
+    // diagnostic, so disabled tracing needs no clock read on a pending poll.
+    uint64_t t0 = trace ? now_ns() : 0; int r = nvn_fence_wait(o->fence, timeout);
+    if (trace) SEQ("syncwait %p kind %u timeout %llu waited %.2f ms -> %d", (void *)s, o->fenced, (unsigned long long)timeout, (now_ns() - t0) / 1e6, r);
     return r ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
 }
 NVN(nvnEventBuilderSetDefaults, void, NVNeventBuilder *b) { memset(b, 0, sizeof(ev_builder_t)); }
@@ -1205,6 +1247,7 @@ static uint64_t g_replaying;   // the job being replayed (nvn_replaying_job)
 static uint64_t g_job_enq, g_job_done, g_job_fence[JOB_RING];   // jobs queued and replayed so far; the commit fence each left (by job number)
 static pthread_mutex_t g_job_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_job_cv = PTHREAD_COND_INITIALIZER, g_jobdone_cv = PTHREAD_COND_INITIALIZER;
 static int nvn_async(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_ASYNC"); on = e && atoi(e); } return on; }
+__attribute__((weak)) int mtl_cpu_upload(const uint64_t *h, int n) { (void)h; (void)n; return 0; }
 static void submit_now(NVNqueue *q, int n, const NVNcommandHandle *h);
 static void *replay_main(void *arg) {
     (void)arg;
@@ -1300,18 +1343,37 @@ NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h)
         job_push((nvn_job){JOB_SUBMIT, n, c, q}); return; }
     submit_now(q, n, h);
 }
+#if defined(__ANDROID__)
+// Android has no Mach power counters, so power_line returns before its yield stats.
+// Optional wall-time summaries distinguish runtime back-off from other short waits.
+static void thread_wait_profile(void) {
+    static _Atomic int enabled = -1; int on = atomic_load(&enabled);
+    if (on < 0) { const char *e = getenv("DM_THREAD_WAIT_PROF"); on = e && atoi(e) > 0; atomic_store(&enabled, on); }
+    if (!on) return;
+    static _Atomic uint64_t last; static _Atomic unsigned reports;
+    if (atomic_load(&reports) >= 24) return;
+    uint64_t now = now_ns(), prev = atomic_load(&last);
+    if (prev && now - prev < 5000000000ull) return;
+    if (!atomic_compare_exchange_strong(&last, &prev, now)) return;
+    atomic_fetch_add(&reports, 1);
+    void dm_yield_top(char *, size_t); char top[512]; dm_yield_top(top, sizeof top);
+    LOG("[threads] wait profile at monotonic %.3f ms; top yielders since previous report: %s", now / 1e6, top);
+}
+#endif
 static void submit_now(NVNqueue *q, int n, const NVNcommandHandle *h) {
     SEQ("submit %d handles", n);
     gfx_enter();
     pthread_mutex_lock(&g_sub_mu);
     uint64_t t0 = now_ns(), c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID), i0, y0, s0 = thr_sys_ns(); thr_counts(&i0, &y0);
     if (!nvn_async()) ((queue_t *)q)->submits++;
-    mtl_sub_begin();
-    nvn_ft_poll();
-    mtl_sub_index((const uint64_t *)h, n);
-    for (int i = 0; i < n; i++) { mtl_exec_rest((const uint64_t *)h + i + 1, n - i - 1); mtl_exec((const uint8_t *)h[i]); }
-    mtl_exec_rest(NULL, 0);
-    mtl_sub_commit();
+    if (!mtl_cpu_upload((const uint64_t *)h, n)) {
+        mtl_sub_begin();
+        nvn_ft_poll();
+        mtl_sub_index((const uint64_t *)h, n);
+        for (int i = 0; i < n; i++) { mtl_exec_rest((const uint64_t *)h + i + 1, n - i - 1); mtl_exec((const uint8_t *)h[i]); }
+        mtl_exec_rest(NULL, 0);
+        mtl_sub_commit();
+    }
     pthread_mutex_unlock(&g_sub_mu);
     uint64_t dw = now_ns() - t0;
     atomic_fetch_add(&g_nvn_ns, dw); atomic_fetch_add(&g_sub_wall_ns, dw);
@@ -1320,6 +1382,9 @@ static void submit_now(NVNqueue *q, int n, const NVNcommandHandle *h) {
     atomic_fetch_add(&g_sub_cpu_ns, dc); atomic_fetch_add(&g_cum_sub_cpu_ns, dc);
     atomic_fetch_add(&g_sub_instr, di); atomic_fetch_add(&g_cum_sub_instr, di);
     gfx_leave();
+#if defined(__ANDROID__)
+    thread_wait_profile();   // outside graphics/submit locks
+#endif
 }
 
 // Commands that only affect GPU state / only execute on the GPU: the null device only counts them (the thunk has already counted)
@@ -1416,7 +1481,7 @@ __attribute__((weak)) void dm_thread_cpu(char *out, size_t n, double secs) { (vo
 void mtl_res_stats(char *out, size_t n);
 void mtl_barrier_stats(uint64_t *skip, uint64_t *full);
 extern uint32_t mtl_present_qos(void);
-static uint64_t g_frame;
+static _Atomic uint64_t g_frame;
 static uint64_t g_acq_wait_ns, g_pq_wait_ns;   // Accumulated display-link wait / wait for the present queue to return inside acquire, recorded per frame at present (there can be several acquires within one frame)
 static uint64_t g_fs_start, g_fs_wait;   // frame step (fstep_tick): when the first acquire after a present returned (the frame's start, 0 = none yet), and its pacing wait
 uint64_t dm_nvn_frame_count(void) { return g_frame; }
@@ -1583,7 +1648,7 @@ static void tsummary(uint64_t frame) {
         double v[TWIN]; memcpy(v, g_tw[k], n * sizeof *v); qsort(v, n, sizeof *v, dcmp);
         o += snprintf(line + o, sizeof line - o, " %s p50 %.2f / p95 %.2f / max %.2f ms (%u frames);", g_tname[k], v[n / 2], v[(n * 95) / 100 < n ? (n * 95) / 100 : n - 1], v[n - 1], n);
     }
-    LOG("[nvn] timing up to frame %llu:%s", frame, line);
+    LOG("[nvn] timing up to frame %llu:%s checkpoint_monotonic_ms=%.3f", frame, line, now_ns() / 1e6);
     double tgt = 1000.0 / mtl_fps_target();   // milliseconds one frame should take: 16.7 at 60 fps, 33.3 when the game itself asks for 30 (the over-time / dropped-frame counts below use it)
     { unsigned n = g_tn[0] < TWIN ? g_tn[0] : TWIN, over = 0; double v[TWIN];   // frame interval gets its own line (M1 baseline): number of frames longer than one frame period in this window and p99
       if (n) { memcpy(v, g_tw[0], n * sizeof *v); qsort(v, n, sizeof *v, dcmp); for (unsigned i = 0; i < n; i++) over += v[i] > tgt;
