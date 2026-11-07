@@ -1,6 +1,6 @@
 # The Vulkan shader bundle (nxnative/dm/android/tools/dmsv.py): tiny bundles written, read back, converted between versions 1 and 2, and read by the host's own
 # reader (gfx_vk_shader.c, its bundle functions compiled with the vendored zstd decoder when a C compiler is at hand).
-import contextlib, io, os, random, shutil, struct, subprocess, sys, tempfile, unittest
+import contextlib, io, os, random, re, shutil, struct, subprocess, sys, tempfile, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -80,6 +80,9 @@ class HostReader(unittest.TestCase):   # gfx_vk_shader.c's bundle functions (vk_
     def setUpClass(cls):
         cls.d = Path(tempfile.mkdtemp(prefix='nx2a_test_dmsv_c_')); src = (REPO / 'nxnative/dm/android/gfx_vk_shader.c').read_text(encoding='utf-8')
         body = src[src.index('// spv_size: 0 ='):src.index('// Run-time capture:')]
+        header = (REPO / 'nxnative/dm/android/gfx_vk.h').read_text()
+        defs = '\n'.join(re.search(p, header).group() for p in [r'enum \{ RK_SUPPORT[^\n]+', r'enum \{ RD_UBO[^\n]+', r'typedef struct __attribute__\(\(packed\)\) \{[^\n]+\} dmsv_bind;'])
+        body = defs + '\n#include "shader_image_usage.h"\n' + body
         harness = r'''
 #include <fcntl.h>
 #include <pthread.h>
@@ -106,7 +109,7 @@ int main(int argc, char **argv) {   // each shader: key, stage, words, FNV-1a 64
 }
 '''
         (cls.d / 'h.c').write_text(harness, encoding='utf-8'); z = REPO / 'nxnative/dm/third_party/zstd'
-        subprocess.run(['cc', '-O1', '-std=gnu11', '-Wall', '-Werror', '-Wno-unused-function', '-I', str(z), '-c', str(cls.d / 'h.c'), '-o', str(cls.d / 'h.o')], check=True)
+        subprocess.run(['cc', '-O1', '-std=gnu11', '-Wall', '-Werror', '-Wno-unused-function', '-I', str(z), '-I', str(REPO / 'nxnative/dm/android'), '-c', str(cls.d / 'h.c'), '-o', str(cls.d / 'h.o')], check=True)
         subprocess.run(['cc', '-O1', '-w', '-fvisibility=hidden', '-DZSTDLIB_VISIBLE=', '-DZSTDERRORLIB_VISIBLE=', '-c', str(z / 'zstddeclib.c'), '-o', str(cls.d / 'z.o')], check=True)
         subprocess.run(['cc', str(cls.d / 'h.o'), str(cls.d / 'z.o'), '-o', str(cls.d / 'h')], check=True)
 

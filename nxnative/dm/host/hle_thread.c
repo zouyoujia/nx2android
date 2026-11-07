@@ -20,6 +20,7 @@
 #include <pthread/qos.h>
 #include <dlfcn.h>
 #include <stdatomic.h>
+#include "yield_census.h"
 
 #define R_TIMEOUT     0xEA01u   // Kernel module 1, description 117
 #define R_CANCELLED   0xEC01u   // 118
@@ -92,6 +93,50 @@ static pthread_mutex_t G = PTHREAD_MUTEX_INITIALIZER;
 #define MAX_H 4096
 static struct { int type; void *obj; } g_h[MAX_H];
 static pthread_key_t g_keythr;
+
+// PJD110 main-thread samples spent 53/539 on-CPU samples in yield and 37/539
+// in condition wake syscalls. Capture guest callers before changing semantics.
+// The main thread alone owns the histogram; control only publishes a budget.
+static _Atomic int g_yc_request = -1;
+static dm_yc_state g_yc;
+static void yield_census_request(const char *value) {
+    unsigned n = dm_yc_budget(value);
+    atomic_store_explicit(&g_yc_request, (int)n, memory_order_release);
+    LOG("[yield-census] request %u main-thread yield calls (maximum %u; 0 cancels)", n, DM_YC_MAX);
+}
+// site_gate pushes guest x29/x30 before dm_gate allocates its 800-byte frame.
+// regs[30] is the gate identifier, NOT the guest return address. Read the saved
+// caller only from the currently registered SVC frame, never from a guest FP.
+static uint64_t yield_census_caller(thr_t *me, const uint64_t *regs) {
+    return me && regs && atomic_load_explicit(&me->svc_regs, memory_order_acquire) == regs ? regs[800 / 8 + 1] : 0;
+}
+static void yield_census_note(thr_t *me, const uint64_t *regs, uint64_t begin, uint64_t end, uint64_t run, int moved, int slept) {
+    // Disabled: one atomic load, no environment lookup, lock or clock read.
+    int request = atomic_load_explicit(&g_yc_request, memory_order_acquire);
+    if (request >= 0) {
+        request = atomic_exchange_explicit(&g_yc_request, -1, memory_order_acq_rel);
+        if (request >= 0) dm_yc_start(&g_yc, (unsigned)request);
+    }
+    if (!g_yc.remaining) return;
+    uint64_t caller = yield_census_caller(me, regs);
+    if (!dm_yc_note(&g_yc, regs, caller, begin, end, run, moved, slept)) return;
+    LOG("[yield-census] complete: %u calls, %u sites, %u overflow calls, %u unlocated calls; window %.3f ms, yield wall %.3f ms (includes scheduling/sleep; not CPU time)",
+        g_yc.samples, g_yc.nsite, g_yc.overflow, g_yc.unlocated, (g_yc.end - g_yc.begin) / 1e6, g_yc.elapsed / 1e6);
+    for (unsigned i = 0; i < g_yc.nsite; i++) {
+        const dm_yc_site *p = &g_yc.site[i]; module_t *m = module_of((void *)(uintptr_t)p->lr);
+        LOG("[yield-census] site %s+%#llx caller=%#llx gate=%#llx calls=%llu moved=%llu sleeps=%llu wall_ms=%.3f max_ms=%.3f max_run_ms=%.3f; ns_first=%lld ns_last=%lld zero/negative/positive=%llu/%llu/%llu",
+            m ? m->name : "?", (unsigned long long)(m ? p->lr - (uint64_t)m->base : p->lr), (unsigned long long)p->lr, (unsigned long long)p->gate,
+            (unsigned long long)p->count, (unsigned long long)p->moved, (unsigned long long)p->slept, p->elapsed / 1e6, p->max_elapsed / 1e6, p->max_run / 1e6, (long long)p->first_ns, (long long)p->last_ns,
+            (unsigned long long)p->zero, (unsigned long long)p->negative, (unsigned long long)p->positive);
+        char first[240], last[240]; size_t a = 0, b = 0;
+        for (unsigned j = 0; j < 10; j++) {
+            a += (size_t)snprintf(first + a, sizeof first - a, " x%u=%#llx", j + 19, (unsigned long long)p->first[j]);
+            b += (size_t)snprintf(last + b, sizeof last - b, " x%u=%#llx", j + 19, (unsigned long long)p->last[j]);
+        }
+        LOG("[yield-census] first:%s; last:%s", first, last);
+    }
+}
+
 static uint64_t g_next_id = 0x51;
 static thr_t *g_wait;          // All waiting threads (lock / condition / address / synchronization)
 
@@ -352,6 +397,7 @@ static void ctx_fill(const thr_t *t, hz_ctx_t *o) {   // holding G, t is stopped
 uint32_t svc_thread_main_init(void) {
     pthread_key_create(&g_keythr, NULL);
     qos_map_init();
+    { const char *e = getenv("DM_YIELD_CENSUS"); if (e) yield_census_request(e); }
     pause_install();
     thr_t *t = calloc(1, sizeof *t);
     pthread_cond_init(&t->cv, NULL); pthread_cond_init(&t->pcv, NULL);
@@ -594,8 +640,10 @@ static void thr_yield(thr_t *me, const uint64_t *regs) {
     for (int i = 19; i <= 28; i++) sig = (sig ^ regs[i]) * 0x100000001b3ull;
     int moved = me->yrun_svc + 1 == me->nsvc && me->yrun_sig != sig;   // the loop moved on since its last yield
     me->nyield++; if (me->yrun_svc + 1 != me->nsvc || moved) me->yrun_t0 = y0; me->yrun_svc = me->nsvc; me->yrun_sig = sig;
+    uint64_t backoff = me->nbackoff;
     if (!moved) yield_for(me, y0 - me->yrun_t0);
-    if (me->handle == 0x1001) { g_main_yield_ns += now_ns() - y0; g_main_yield_n++; }
+    if (me->handle == 0x1001) { uint64_t end = now_ns(); g_main_yield_ns += end - y0; g_main_yield_n++;
+        yield_census_note(me, regs, y0, end, y0 - me->yrun_t0, moved, me->nbackoff != backoff); }
 }
 // Spin waits (patch_nso.py "Spin waits"): a guest loop that polls memory with no SVC, which the rewriter has made go through a spin gate on every pass after the first. On the Switch
 // such a poll costs nothing while another thread of its core has work (a higher-priority one preempts it); here it takes a host core from the threads doing the work: Paper Mario:
@@ -716,6 +764,7 @@ static int wait_bt_state(void) {
     return state;
 }
 void dm_thread_runtime_env_changed(const char *name, const char *value) {
+    if (name && !strcmp(name, "DM_YIELD_CENSUS")) { yield_census_request(value); return; }
     if (!name || strcmp(name, "DM_SLEEP_BT")) return;
     pthread_mutex_lock(&g_wait_bt_mu); wait_bt_config_locked(value); pthread_mutex_unlock(&g_wait_bt_mu);
 }

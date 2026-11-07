@@ -30,6 +30,7 @@ class RuntimeWaitDebug(unittest.TestCase):
 #include <stdlib.h>
 #include <string.h>
 static const char *startup;
+static void yield_census_request(const char *value) {(void)value;}
 static _Atomic unsigned env_reads, locks, unlocks, logs, backtraces;
 static _Atomic uint64_t last_fp; static _Thread_local unsigned held_config;
 static char last_what[64]; static double last_ms;

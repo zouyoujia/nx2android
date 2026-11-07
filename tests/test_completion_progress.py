@@ -39,7 +39,8 @@ static int counted_lock(pthread_mutex_t *m) {atomic_fetch_add(&observed_locks,1)
 static int counted_unlock(pthread_mutex_t *m) {atomic_fetch_add(&observed_unlocks,1);return pthread_mutex_unlock(m);}
 static int counted_wait(pthread_cond_t *c,pthread_mutex_t *m,const struct timespec *t) {atomic_fetch_add(&observed_waits,1);return pthread_cond_timedwait(c,m,t);}
 static int counted_broadcast(pthread_cond_t *c) {atomic_fetch_add(&observed_broadcasts,1);return pthread_cond_broadcast(c);}
-static uint64_t sync_clock(void) {struct timespec t;counted_clock(CLOCK_MONOTONIC,&t);return (uint64_t)t.tv_sec*1000000000+t.tv_nsec;}
+static int g_sync_prof=1;
+static uint64_t sync_clock(void) {if(!g_sync_prof)return 0;struct timespec t;counted_clock(CLOCK_MONOTONIC,&t);return (uint64_t)t.tv_sec*1000000000+t.tv_nsec;}
 static void sync_add(int kind,uint64_t begin) {(void)kind;(void)begin;}
 static pthread_mutex_t g_done_mu=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_done_cv=PTHREAD_COND_INITIALIZER;
@@ -50,9 +51,11 @@ static _Atomic int visible,cache_saved;
 static uint64_t g_fence;
 static int g_prereset;
 static void vk_gpu_segments_request(int n){(void)n;}
-typedef struct {uint64_t fence;int nmain_alloc,nup_alloc;int mains[2],ups[2];} vksub_t;
+typedef struct {uint64_t fence;int nmain_alloc,nup_alloc,nmain_used,nup_used;int mains[2],ups[2];} vksub_t;
 typedef struct {uint64_t fence;int rslot;} cpend;
 static vksub_t g_slot[NSLOT];
+enum {VK_EFF_RESETS,VK_EFF_UNUSED_RESETS};
+static void efficiency_add(int k,uint64_t n){(void)k;(void)n;}
 static int vkResetCommandBuffer(int cb,int flags) {
     assert(cb>0 && !flags);
     pthread_mutex_lock(&gate_mu);resets++;reset_entered=1;pthread_cond_broadcast(&gate_cv);
@@ -107,6 +110,18 @@ static void test_fast_queries(void) {
     assert_no_waiting_calls(before);
     assert(g_poll_zero==8 && g_poll_fast_queries==8 && g_poll_pending==3);
     assert(!g_poll_legacy_cond && !g_poll_positive && !g_poll_zero_ns && !g_poll_positive_ns);
+}
+static void test_diagnostic_off(void) {
+    g_sync_prof=0;observed before=observations();
+    for(int i=0;i<100000;i++){assert(!completion_wait(1,0,0));assert(completion_wait(0,0,1));}
+    assert_no_waiting_calls(before);
+    assert(!g_poll_zero && !g_poll_fast_queries && !g_poll_pending && !g_poll_positive);
+    completion_publish(5,1,0);before=observations();assert(completion_wait(5,0,0) && !completion_wait(5,0,1));assert_no_waiting_calls(before);
+    assert(!g_poll_zero && !g_poll_fast_queries && !g_poll_pending);
+    // Restoring the legacy path changes waits, while diagnostics remain off.
+    dm_runtime_env_changed("DM_VK_POLL_FAST","0");assert(!completion_wait(6,0,0));
+    assert(!g_poll_zero && !g_poll_pending && !g_poll_legacy_cond);
+    assert(!completion_wait(6,1000,0));assert(!g_poll_positive && !g_poll_positive_blocked && !g_poll_positive_ns);
 }
 static void test_legacy_rollback(void) {
     dm_runtime_env_changed("DM_VK_POLL_FAST","0");
@@ -174,7 +189,7 @@ static void run(int early,int prereset,int slot,uint64_t f,int flip_early) {
     g_done=g_slot_ready=0;g_done_at=0;
     post_allowed=reset_entered=resets=0;reset_allowed=0;
     atomic_store(&visible,0);atomic_store(&cache_saved,0);
-    if(slot>=0){g_slot[slot]=(vksub_t){.fence=f,.nmain_alloc=1,.nup_alloc=1,.mains={1},.ups={2}};}
+    if(slot>=0){g_slot[slot]=(vksub_t){.fence=f,.nmain_alloc=1,.nup_alloc=1,.nmain_used=1,.nup_used=1,.mains={1},.ups={2}};}
     cpend c={f,slot};waiter game={.fence=f},reuse={.fence=f,.reusable=1};pthread_t complete,game_t,reuse_t,drain;
     assert(!pthread_create(&complete,NULL,complete_thread,&c));
     assert(!pthread_create(&game_t,NULL,wait_thread,&game));
@@ -216,7 +231,8 @@ static void test_ordering(void) {
 }
 int main(int argc,char **argv) {
     assert(argc==2);
-    if(!strcmp(argv[1],"fast"))test_fast_queries();
+    if(!strcmp(argv[1],"off"))test_diagnostic_off();
+    else if(!strcmp(argv[1],"fast"))test_fast_queries();
     else if(!strcmp(argv[1],"legacy"))test_legacy_rollback();
     else if(!strcmp(argv[1],"positive"))test_positive_wait();
     else if(!strcmp(argv[1],"visibility"))test_publication_visibility();
@@ -240,6 +256,9 @@ int main(int argc,char **argv) {
 
     def test_fast_zero_queries_avoid_waiting_calls(self):
         self.run_case('fast')
+
+    def test_diagnostic_off_skips_counters_without_changing_results(self):
+        self.run_case('off')
 
     def test_live_control_can_restore_legacy_poll(self):
         self.run_case('legacy')

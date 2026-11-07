@@ -213,8 +213,14 @@ are rejected. Uniform checks include descriptor alignment prefixes. Vertex reads
 initially reject the whole Vulkan backing buffer, covering indexed fetches beyond
 the NVN bound; indirect and unresolved resources fall back. Deferred handle reads,
 copies, uniform updates, clears, counters, transform feedback, dispatches and
-unknown records flush before execution. Natural pass ends and the 128-draw cap
-also discharge pending synchronization. No draw or shader work is dropped.
+unknown records flush before execution. Natural pass ends and the draw cap
+also discharge pending synchronization. `DM_VK_TEXTURE_BARRIER_DRAWS` changes
+that policy window per submission (128 by default, bounded to 128..512; invalid
+values fall back to 128). A live window change first discharges any pending
+dependency and resets its diagnostic interval. Larger windows retain every
+resource/writer/generation check, full state rebinding, and the independent
+command-buffer size/depth/LRZ cut rules. No default is raised without device
+correctness and operation-count validation. No draw or shader work is dropped.
 
 Registration/view-drop generation publication is atomic. A descriptor cache stores
 the generation taken before lookup, so a racing rewrite cannot mark an older
@@ -415,8 +421,8 @@ control/on/control trial had CPU replay means 7.37/7.17/7.07 ms; the continuing
 control improvement prevents attributing a benefit. Two heavy fragment SPIR-V
 modules validated after offline optimization (~38% fewer static instructions),
 but replacement/control/replacement GPU spans were 25.58/25.28/25.22 ms. Both
-modules loaded; no stable device benefit was established. Neither experiment is
-enabled by default. These windows used another stationary outdoor-menu view.
+modules loaded; no stable device benefit was established. Neither experiment was
+enabled after that timing trial. These windows used another stationary outdoor-menu view.
 
 CPU part milestones also bound application queue lead: the final part's submit
 returned at least 1.63-3.79 ms before the previous part could have finished on the
@@ -521,3 +527,187 @@ The port retains Apple Silicon GLSLC capture and portable subgroup inlining whil
 accepting the parent's device Oodle rounds, compressed DMSV format, adaptive icons
 and external-display options. GPU performance hooks remain opt-in. Parent updates
 have been compiled for DQB2; their gameplay performance has not been measured.
+
+
+`DM_VK_SCOPED_BARRIERS=1` (live, default off) narrows only the consumer side of
+input barriers immediately before compute dispatch, buffer copy/fill, and
+buffer/image transfers. Producer stages and accesses remain ALL_COMMANDS and
+MEMORY_READ/WRITE. Compute includes uniform/shader reads and shader writes;
+indirect compute also includes DRAW_INDIRECT and INDIRECT_COMMAND_READ. Transfers
+include their read/write accesses; fills include transfer writes. Every operation
+retains its following full barrier, which publishes all earlier writes to all
+later consumers. The unsafe no-output-dispatch-barrier diagnostic falls back to
+the old full input dependency; unknown kinds do too. No copy, dispatch, readback
+mark, explicit NVN barrier or depth/LRZ protection is skipped.
+`DM_VK_EFFICIENCY_PROF=1` (startup, default off) reports actual early/final queue
+submissions and main/upload command buffers plus full/scoped input barriers per
+300-present window. Final submissions include fence-only recovery. Counters are
+disabled otherwise; snapshots are atomic and no GPU timestamps are added. These
+counts separate a changed cut threshold from actually reduced submissions.
+
+DQB2 opts into a 256-draw command-buffer cut threshold and scoped inputs after
+a same-process PJD110 outdoor-menu comparison (1441 draws/frame). Raising the
+threshold from 128 to 256 reduced main command buffers from five to four and
+early submissions from three to two per frame; 384 reduced neither further.
+Scoped inputs replaced two full input barriers per frame. Individual/combined
+phases remained about 44.4-44.6 FPS and 21.9 ms frame p50: no frame-rate gain is
+claimed. The lower timestamp span after changing cuts is not evidence of less
+GPU execution work; it can move work outside the measured interval. Core
+defaults remain 128 and full input barriers; depth/LRZ protections are unchanged.
+
+DQB2 additionally enables literal adjacent-barrier deduplication: the current
+same-process census omitted 49,200 barriers over 600 frames, while all 1441
+draws and 56 passes/frame stayed present. Sparse independent barrier intervals
+fell from 217 to 135/frame; the capture itself has fewer timestamp commands, so
+its elapsed time is not a speedup estimate. The CPU rebind fast path is retained
+for eliminating repeated state-cache clears under the user's work-reduction
+criterion. Every binding site still emits its complete Vulkan commands, with
+real cache resets on command-buffer changes and explicit stale invalidation.
+Neither retention establishes a frame-rate gain. Offline shader replacements
+remain disabled; the heavy two-draw full-HD pass uses the same previously
+examined shaders, so instruction-count reductions alone do not justify them.
+
+`DM_YIELD_CENSUS=N` is a default-off, live, bounded main-thread yield caller
+census (maximum 8192 calls/16 sites; 0 cancels). Only guest main-thread
+SleepThread yields are included, not rewritten spin gates or other threads.
+It reuses the yield's existing register frame and monotonic timestamps, without
+walking stacks, dereferencing guest pointers, suspending threads or changing
+yield/back-off choices. A main-thread-owned histogram records original caller LR, gate LR, counts,
+progress-signature changes, back-off sleeps, wall/run maxima and first/last
+x19-x28 snapshots. Unknown/excess sites are reported as overflow. The existing
+time measurements include sleeps/scheduling and are not CPU time. One summary
+and at most 32 detail lines are emitted after the budget ends; new requests
+rearm, and disabled observation performs no environment scans, locks or clock
+reads. It is diagnostic evidence for a wait loop, not proof of which producer
+or GPU task that loop waits for.
+
+The yield census reads the original caller from the registered SVC gate frame
+(the 800-byte dm_gate frame plus site_gate's saved x29/x30 pair). Register x30
+at dispatch is only a rewriter gate identifier. Arbitrary/unregistered register
+arrays report an unlocated caller and never read beyond x30. This is a bounded
+read of the known gate ABI, not a guest frame-pointer stack walk. The first
+device capture that reported only sdk+0xc2326c identified the SVC gate and must
+not be interpreted as a game yield call site.
+
+Per-site first/last SleepThread arguments and zero/negative/positive counts
+also distinguish deliberate yields from short positive sleeps below 20 us that
+share this host path. The original scheduling choice and argument are untouched.
+
+Completion retirement resets only the submission's used main/upload command
+buffer prefixes, instead of every buffer ever allocated by the slot. Reuse
+waits for prior retirement before any new recording, so unused allocated
+buffers are already INITIAL (or newly allocated). The conservative upload
+prefix still includes a possibly unbegun trailing buffer and refused-submission
+recovery; no possibly recorded upload buffer is omitted. Game-visible completion
+still follows copy-back and post effects, and slot reuse still follows all
+required resets. The efficiency diagnostic reports actual resets and redundant
+resets avoided. This removes driver API work; a frame-time gain or a dominant
+reset delay has not been established for the current scene.
+
+Completion poll diagnostics now increment counters only with `DM_VK_SYNC_PROF=1`.
+With profiling off, a pending fast zero-timeout query retains its acquire-load
+and result, omitting three diagnostic atomic additions. Positive/legacy waits
+retain their actual waits; the two queries and result-code races in NVN SyncWait
+are unchanged. This matters for the observed game-side SyncWait(0)/YieldThread
+loop, but removing counter work is not evidence that GPU execution or publication
+latency improved.
+
+
+`DM_VK_IMAGE_AUDIT=1` enables a bounded, read-only audit of actual render
+attachments (at most 96 new image/view combinations). It records image/view
+formats, format lists, actual creation flags and usage, layout and allocation
+size. When advertised, `VK_EXT_image_compression_control` is enabled only for
+this audit and its optional `vkGetImageSubresourceLayout2EXT` entry point queries
+compression controls for colour and single-aspect depth/stencil attachments.
+Missing extension/entry point, an unwritten result, and combined depth/stencil
+are reported as unknown. OPTIMAL image pitches are undefined and are never
+read. No fixed-rate/lossy compression, creation override, layout change or extra
+GPU command is requested. A default-control result or a larger allocation is
+not a measured compression ratio or proof of effective bandwidth savings.
+
+DQB2 opts into a 256-draw guarded window after actual production-helper tests
+kept the same 1,024 independent draws/1,023 invalidations and reduced physical
+pass ends/full barriers from eight to four. PJD110 remained in the same process
+with no new errors and normal visible gameplay/UI. Device phase cameras and
+draw counts differed, so their FPS/count differences are not matched-workload
+effect estimates. Full rebinding, hazard checks, natural ends and depth/CB
+protections remain. A 36-target audit found all format-listed with compatible
+attachment views and no mutable depth flags; the optional compression query
+was unavailable. Actual UBWC activation remains unknown.
+
+
+### Optimizations identified on PJD110 (2026-11-06)
+
+1. **Fused pre-rotated presentation (retained 2026-11-07).** The original
+   3168x1440 window was composed
+   into an intermediate image (clear, scaled game blit, overlay load/store),
+   then sampled by a full-screen rotation draw into the 1440x3168 swapchain.
+   Rendering game and overlay directly into the pre-rotated swapchain could
+   remove an intermediate store/read and rendering phase. Keep pre-rotation,
+   source resolution/filtering, crop/aspect/borders, color space, UI, correct
+   acquire wait stages and descriptor/image lifetimes, with an original-path
+   fallback. Game submission GPU timestamps do not include present commands.
+   Both use the same queue, but no evidence yet assigns the observed part gap
+   to presentation. A 3168x1440 RGBA8 image is 18,247,680 logical bytes; this is
+   not measured bandwidth, compression, time saved or an FPS estimate.
+2. **Storage-image usage trimming (retained 2026-11-07).** In the original
+   audit of 36 actual render
+   targets, 29 request `VK_IMAGE_USAGE_STORAGE_BIT`, while reflection of the
+   current 2,107-shader bundle has no storage-image bindings. Confirm actual
+   runtime image access and future captured-shader handling, then design a safe
+   capability upgrade/fallback before narrowing usage. Static bundle absence
+   does not prove permanent non-use. The implemented immutable-bundle gate below
+   retains STORAGE for any unknown/storage-using interface. The usage flag does
+   not establish UBWC is disabled on the stock Adreno 750 driver.
+
+Both are implemented by the optional paths below. Correct removal of
+unnecessary operations/resources is
+a retention criterion without an FPS requirement; measured performance claims
+need their own evidence.
+
+
+### Optional fused presentation and image usage trimming
+
+`DM_VK_PRESENT_FUSED=1` (default off; live) samples supported single-layer 2D
+RGBA8/BGRA8 window images with linear base-level filtering directly into the
+final swapchain colour pass. The same pass clears black borders and draws the
+UI with the same logical window coordinates, rotated in the vertex shader.
+Crop/aspect rounding, lower-left source origin and sRGB source/target formats
+are preserved. Pre-rotation remains enabled; when the fused path is ready at
+swapchain creation it needs no intermediate rotation image. Unsupported source
+formats, dimensions, filtering, features or setup failure use the original
+composition (lazily creating its rotation target). A later live fallback may
+keep that target allocated until swapchain destruction.
+
+The acquired image is first written at colour-attachment output in fused mode
+(transfer in the legacy mode). Each present slot owns its descriptor and waits
+for its existing fence before updating it. The source sampling view is owned
+by its image, cached under the view mutex and retired with the existing image
+views. Swapchain recreation waits for idle before releasing fused resources.
+Opt-in image audit reports actual fused/original submit counts, without extra
+GPU timestamp work; it does not measure saved time or assign part gaps to
+presentation.
+
+`DM_VK_IMAGE_USAGE_TRIM=1` (default off; startup) omits the STORAGE image usage
+hint from guest images only when every entry in the immutable process shader
+bundle has valid, known reflection with no storage-image interface. Sampled
+views then request only usages the image actually owns. Storage-using bundles,
+unknown/malformed/missing/empty bundles and internal/dummy images retain the
+original capability policy. The bundle is opened only by its private
+pthread-once path; captured missing shaders cannot execute until a repack and
+restart. Thus this proof does not rely on an observed scene or assume future
+captured shaders are read-only. Storage buffers remain unchanged. A reduction
+in unused Vulkan capabilities is not proof of UBWC activation or FPS gain.
+
+
+DQB2 opts into both paths after PJD110 validation on 2026-11-07: 300
+consecutive fused/zero legacy display submits, no new runtime errors, and all
+35 audited current render targets without STORAGE usage. These are executed
+path/capability observations, not a matched-FPS or UBWC-activation claim. The
+user confirmed normal walking, camera, game/pause menus, text and touch
+direction. 195 host checks and all 143 native compilation units passed; the
+overlay SPIR-V validated with the 40-byte push ABI (alpha 32, turn 36). Both
+shared-core defaults stay off. The installed diagnostic APK remains usable;
+its next-launch environment enables the two paths and disables image audit.
+The current process retains startup audit until restart, but no timed GPU
+sampling or device-control loop remains active.

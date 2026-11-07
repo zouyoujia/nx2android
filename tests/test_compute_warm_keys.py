@@ -145,6 +145,7 @@ int main(int argc,char **argv){
 #include <string.h>
 #include "pass_census.h"
 #include "gpu_segments.h"
+#include "scoped_sync.h"
 static uint32_t g_pass_segment __attribute__((unused));
 static inline __attribute__((unused)) uint32_t vk_gpu_segment_begin(uint32_t kind,uint64_t tag,uint32_t w,uint32_t h){(void)kind;(void)tag;(void)w;(void)h;return 0;}
 static inline __attribute__((unused)) void vk_gpu_segment_end(uint32_t token,uint32_t count){(void)token;(void)count;}
@@ -199,6 +200,7 @@ void vk_end_pass_land_reason(enum vk_pass_end_reason reason){assert(reason==VK_P
 static VkCommandBuffer vk_cmd(void){return (VkCommandBuffer)(uintptr_t)7;}
 static VkDescriptorSet stage_set(int stage,vkshader_t *cs,uint32_t *offsets){assert(stage==5 && cs==&shader && offsets);g_num_um=want_um;g_num_im=want_im;return (VkDescriptorSet)(uintptr_t)5;}
 static void vk_img_barrier_all(VkCommandBuffer cb){assert(cb==vk_cmd());}
+static void vk_barrier_before(VkCommandBuffer cb,int kind){assert(kind==VK_BEFORE_COMPUTE || kind==VK_BEFORE_COMPUTE_INDIRECT);vk_img_barrier_all(cb);}
 static void vkCmdBindPipeline(VkCommandBuffer cb,VkPipelineBindPoint point,VkPipeline p){assert(cb==vk_cmd() && point==VK_PIPELINE_BIND_POINT_COMPUTE);bound=p;}
 static void vkCmdBindDescriptorSets(VkCommandBuffer cb,VkPipelineBindPoint point,VkPipelineLayout layout,uint32_t first,uint32_t n,const VkDescriptorSet *sets,uint32_t ndyn,const uint32_t *offsets){assert(cb==vk_cmd() && point==VK_PIPELINE_BIND_POINT_COMPUTE && layout && !first && n==1 && sets && !ndyn && offsets);}
 void vk_pass_ts(int end,uint32_t w,uint32_t h,uint32_t fmt,uint32_t draws){(void)end;(void)w;(void)h;(void)fmt;(void)draws;}

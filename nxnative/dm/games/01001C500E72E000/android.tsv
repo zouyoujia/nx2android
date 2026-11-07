@@ -7,10 +7,30 @@
 # Loading staging reuse: 2676 copied GPU allocations -> 7 allocations + 2669 reuses; bounded 1 MiB.
 # Retained for resource reduction at user request; no loading-time improvement claimed.
 # Per-pool texture index: 116 checks passed; 34816 empty pool drops bypassed full scans on PJD110.
-# Same-pool overlap/alias checks retained; this index build awaits user save graphics confirmation.
+# Same-pool overlap/alias checks retained; user confirmed save graphics and text after source merge.
 # Adaptive pacing disabled at user request: outdoor menu observed 30.00 -> 45.82 FPS after restart.
 # Camera differed slightly, draws 1257 -> 1382; not an exact-workload A/B or a peak-utilization claim.
 # User reached the cabin with normal visible graphics; sustained progression and save/reload remain unverified.
+# Same-process outdoor menu, 1441 draws: CB threshold 128 -> 256 reduced main CBs 5 -> 4
+# and early submits 3 -> 2 per frame. 384 gave no further reduction; depth/LRZ rules retained.
+# Scoped inputs replaced 2 full input barriers per frame; all full output barriers retained.
+# Independent and combined phases stayed about 44.4-44.6 FPS / 21.9 ms; no FPS gain claimed.
+# Adjacent full barriers: 49200/600 frames omitted, independent barrier intervals 217 -> 135/frame.
+# Draw/pass counts and visible menu text retained; no frame-rate improvement claimed.
+# CPU rebind fast path retains all state commands and removes repeated cache clears.
+# Retained under the resource/work-reduction criterion, not the earlier inconclusive timing trial.
+# Guarded invalidation window 128 -> 256: production-helper model keeps 1024 draws,
+# reduces physical pass ends/full barriers 8 -> 4. Per-draw hazards still flush.
+# PJD110 same-process 256 window: no new RED, visible game/UI graphics intact.
+# Camera changed between device phases: observed counts/FPS are not a matched A/B.
+# Compression audit: 36 actual targets, all format-listed, no incompatible views;
+# optional driver compression query unavailable. Actual UBWC state remains unknown.
+# 2026-11-07 fused presentation: 300 consecutive fused/0 legacy submits; original
+# intermediate clear/blit/rotation pass omitted. No FPS effect estimate claimed.
+# Usage trim: current 35 audited targets have 0 STORAGE usages; immutable bundle
+# has no image-storage interfaces. Unknown/storage bundles keep original usage.
+# User confirmed walking, camera, game menu, pause menu, text and touch direction.
+# Stock driver, full resolution, previous barriers/LRZ protection unchanged.
 status	boots
 tested	1.7.3 PJD110 (Adreno 750)
 package	org.nx2a.dqb2
@@ -28,3 +48,10 @@ env	DM_ADPF_WORKERS=1
 env	DM_PIN_GAME=1
 env	DM_VK_STAGING_CACHE=1
 env	DM_ADAPTIVE_FPS=0
+env	DM_VK_CB_DRAWS=256
+env	DM_VK_SCOPED_BARRIERS=1
+env	DM_VK_DEDUP_ADJ_BARRIER=1
+env	DM_VK_REBIND_FAST=1
+env	DM_VK_TEXTURE_BARRIER_DRAWS=256
+env	DM_VK_PRESENT_FUSED=1
+env	DM_VK_IMAGE_USAGE_TRIM=1

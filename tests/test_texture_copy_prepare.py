@@ -22,6 +22,7 @@ class TextureCopyPrepare(unittest.TestCase):
 #include "nvn_obj.h"
 #include "pass_census.h"
 #include "texture_copy_batch.h"
+#include "scoped_sync.h"
 #define VKLOG(...) do {if(0)fprintf(stderr,__VA_ARGS__);}while(0)
 #define VKRED_ONCE(n,...) do {(void)(n);if(0)fprintf(stderr,__VA_ARGS__);}while(0)
 typedef struct {int depth,stencil,compressed;unsigned bw,bh,bpb,dbpp;int dec;} vkfmt_t;
@@ -70,6 +71,7 @@ static void nvn_dirty_protect(const void *p,size_t n){(void)p;(void)n;}
 void vk_end_pass_land_reason(enum vk_pass_end_reason r){(void)r;}
 static int vk_buf_at(uint64_t a,uint64_t n,VkBuffer *b,VkDeviceSize *o){(void)n;assert(a==0x10000);*b=(VkBuffer)(uintptr_t)11;*o=16;return source_ok;}
 static void vk_img_barrier_all(VkCommandBuffer cb){assert(cb==(VkCommandBuffer)(uintptr_t)7);}
+static void vk_barrier_before(VkCommandBuffer cb,int kind){assert(kind==VK_BEFORE_TRANSFER);vk_img_barrier_all(cb);}
 static VkImageSubresourceLayers sub_of(vkimg_t *im,const view_t *v,int has,int z){(void)v;(void)has;(void)z;return (VkImageSubresourceLayers){im->aspect,0,0,1};}
 static uint8_t *vk_scratch(size_t n,int al,VkBuffer *b,VkDeviceSize *o){(void)n;(void)al;(void)b;(void)o;abort();}
 static void vk_bc_decode(const vkfmt_t *f,const void *a,size_t p,uint32_t w,uint32_t h,int d,void *o){(void)f;(void)a;(void)p;(void)w;(void)h;(void)d;(void)o;abort();}

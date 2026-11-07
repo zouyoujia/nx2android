@@ -199,6 +199,34 @@ int main(void){
     setenv("DM_VK_TEXTURE_BARRIER","9",1);texture_barrier_config();assert(!g_tb_mode);
     setenv("DM_VK_TEXTURE_BARRIER","1",1);texture_barrier_config();assert(g_tb_mode==1);
     g_tex_frame=600;texture_barrier_config();assert(g_tb_report==600);texture_barrier_config();
+    // A live limit change flushes an existing dependency before changing policy.
+    reset(2);deferred();setenv("DM_VK_TEXTURE_BARRIER","2",1);setenv("DM_VK_TEXTURE_BARRIER_DRAWS","256",1);
+    texture_barrier_config();assert(g_tb_draw_limit==256 && !g_tb.pending && ends==1 && barriers==1);
+    reset(2);g_pass_draws=127;deferred();
+    for(unsigned i=127;i<256;i++){g_pass_draws=i;texture_barrier_before_draw(0,0,0);assert(g_tb.pending && !ends);}
+    texture_barrier_before_draw(0,0,0);flushed(TB_LIMIT);
+    reset(2);g_pass_draws=256;assert(!texture_barrier_try(0x10));
+    reset(2);g_pass_draws=200;deferred();S.tex[1][0]=2;texture_barrier_before_draw(0,0,0);flushed(TB_TEX_ALIAS);
+    reset(2);g_pass_draws=200;deferred();dirty++;texture_barrier_before_draw(0,0,0);flushed(TB_EPOCH);
+    reset(2);g_pass_draws=200;deferred();S.rast_discard=1;texture_barrier_before_draw(0,0,0);flushed(TB_WRITER);
+    reset(2);g_pass_draws=200;deferred();texture_barrier_record(OP_DISPATCH,NULL);flushed(TB_OP);
+    setenv("DM_VK_TEXTURE_BARRIER_DRAWS","512",1);texture_barrier_config();assert(g_tb_draw_limit==512);
+    const char *invalid[]={"", "0", "-1", "127", "513", "999999999999999999999999", "256junk"};
+    for(unsigned i=0;i<sizeof invalid/sizeof invalid[0];i++){setenv("DM_VK_TEXTURE_BARRIER_DRAWS",invalid[i],1);texture_barrier_config();assert(g_tb_draw_limit==128);}
+    // Identical 1024 independent draws and 1023 invalidations: production guard
+    // and pass-end paths reduce physical ends, not the number of guest draws.
+    for(unsigned limit=128;limit<=256;limit*=2){
+        setenv("DM_VK_TEXTURE_BARRIER_DRAWS",limit==128?"128":"256",1);texture_barrier_config();
+        reset(2);g_pass_draws=1;unsigned draws=1;
+        for(unsigned i=1;i<1024;i++){
+            game_barrier(0x10);texture_barrier_before_draw(0,0,0);
+            if(!S.pass_open){pass_commit();g_pass_draws=0;}
+            g_pass_draws++;draws++;
+        }
+        end_pass_reason(VK_PASS_END_SUBMIT_END,0);
+        assert(draws==1024 && ends==(int)(1024/limit) && barriers==ends && !g_tb.pending);
+    }
+    unsetenv("DM_VK_TEXTURE_BARRIER_DRAWS");unsetenv("DM_VK_TEXTURE_BARRIER");texture_barrier_config();assert(!g_tb_mode && g_tb_draw_limit==128);
     return 0;
 }
 ''')
@@ -216,6 +244,10 @@ int main(void){
 #include "nvn_obj.h"
 static uint64_t g_cmd_gen=7;
 static int g_x_nobc,g_tb_mode,g_bc_stale,g_x_rebind_fast,binds;
+static unsigned cache_clears;
+static void *counted_clear(void *p,int c,size_t n){cache_clears++;return memset(p,c,n);}
+#undef memset
+#define memset counted_clear
 static void vkCmdBindIndexBuffer(VkCommandBuffer cb,VkBuffer b,VkDeviceSize o,VkIndexType t){
     assert(cb==(VkCommandBuffer)(uintptr_t)1 && b==(VkBuffer)(uintptr_t)2 && o==32 && t==VK_INDEX_TYPE_UINT16);binds++;
 }
@@ -234,9 +266,10 @@ int main(void){
     g_cmd_gen++;bind();assert(binds==4);
     g_bc_stale=1;bind();assert(binds==5 && !g_bc_stale);
     g_x_nobc=1;bind();bind();assert(binds==7);
-    g_x_rebind_fast=1;g_bc.vp.width=1920;bind();bind();assert(binds==9 && g_bc.vp.width==1920);
-    g_cmd_gen++;bind();assert(binds==10 && !g_bc.vp.width);
-    g_bc.vp.width=1920;g_bc_stale=1;bind();assert(binds==11 && !g_bc.vp.width);
+    unsigned before=cache_clears;
+    g_x_rebind_fast=1;g_bc.vp.width=1920;bind();bind();assert(binds==9 && g_bc.vp.width==1920 && cache_clears==before);
+    g_cmd_gen++;bind();assert(binds==10 && !g_bc.vp.width && cache_clears==before+1);
+    g_bc.vp.width=1920;g_bc_stale=1;bind();assert(binds==11 && !g_bc.vp.width && cache_clears==before+2);
     g_x_nobc=0;g_tb_mode=2;bind();bind();assert(binds==13);
     g_tb_mode=0;bind();assert(binds==13);
 

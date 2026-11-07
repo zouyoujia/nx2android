@@ -5,6 +5,7 @@
 // geometry 2, tessellation 3 / 4; compute 0) by rewriting the DescriptorSet decorations, so a program's stages never collide.
 #include "gfx_vk.h"
 #include "nvn_hmap.h"
+#include "shader_image_usage.h"
 #include "zstd.h"
 #include <CommonCrypto/CommonDigest.h>
 #include <fcntl.h>
@@ -16,8 +17,9 @@
 // spv_size: 0 = the SPIR-V is stored as it is (spv_len bytes; every version 1 entry), else a zstd frame of spv_len bytes that decompresses to spv_size (version 2)
 typedef struct __attribute__((packed)) { uint64_t key; uint32_t stage, spv_off, spv_len, refl_off, refl_len, spv_size; } bent;
 static const uint8_t *g_bundle; static uint32_t g_nent; static const bent *g_ent;
+static int g_storage_images = 1;   // unknown/missing bundle keeps every image capability
 // Every entry is checked against the file's size once here, so a lookup never reads past the mapping (a copy cut short, say a push stopped outside porter, would fault there)
-void vk_shaders_open(const char *path) {
+static void vk_shaders_open(const char *path) {   // immutable for this process: only bundle_auto/pthread_once opens it
     int fd = open(path, O_RDONLY | O_CLOEXEC); struct stat st;
     if (fd < 0 || fstat(fd, &st)) { VKLOG("[RED] no shader bundle at %s: nothing will be drawn", path); if (fd >= 0) close(fd); return; }
     const uint8_t *b = st.st_size >= 12 ? mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0) : MAP_FAILED; close(fd);
@@ -29,6 +31,12 @@ void vk_shaders_open(const char *path) {
         bad += (uint64_t)e->spv_off + e->spv_len > sz || (uint64_t)e->refl_off + e->refl_len > sz || e->refl_len < 20;
         raw += e->spv_size ? e->spv_size : e->spv_len; stored += e->spv_len; nz += e->spv_size != 0; }
     if (bad) { VKLOG("[RED] %s: %u of its %u shaders lie past the end of the file (%llu bytes), a partial copy: nothing will be drawn", path, bad, n, (unsigned long long)sz); munmap((void *)b, (size_t)sz); return; }
+    int storage = !n;
+    for (uint32_t i = 0; i < n && !storage; i++) {
+        const bent *e = &t[i];
+        storage = e->stage > 5 || vk_reflection_needs_images(b + e->refl_off, e->refl_len);
+    }
+    g_storage_images = storage;
     g_bundle = b; g_nent = n; g_ent = t;
     VKLOG("shader bundle %s: version %u, %u shaders (%u zstd-compressed), %.1f MB; SPIR-V %.1f MB stored, %.1f MB decompressed", path, ver, n, nz, sz / 1048576.0, stored / 1048576.0, raw / 1048576.0);
 }
@@ -40,6 +48,10 @@ static void bundle_open_once(void) {
 // once, and every caller waits until it is open: the replay and the prewarm threads both look shaders up at start, and a lookup that ran before the bundle
 // was open cached its shader as missing for good (every draw skipped as "no program" in some runs)
 static void bundle_auto(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, bundle_open_once); }
+// Missing shaders are captured but never executed until a later repack/restart.
+// Thus immutable bundle reflection bounds every descriptor stage_set can emit;
+// unknown interfaces keep the conservative allocation policy.
+int vk_shader_storage_images(void) { bundle_auto(); return g_storage_images; }
 int vk_shader_keys(uint32_t stage, uint64_t *out, int max) {   // the bundle's shaders of one stage (gfx_vk_exec.c compute_warm)
     bundle_auto(); int n = 0;
     for (uint32_t i = 0; i < g_nent && n < max; i++) { uint32_t st; memcpy(&st, &g_ent[i].stage, 4); if (st == stage) memcpy(&out[n++], &g_ent[i].key, 8); }

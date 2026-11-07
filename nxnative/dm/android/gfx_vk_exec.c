@@ -346,6 +346,7 @@ static struct { vkimg_t *im; VkImageView v; uint32_t fmt, layers, w, h; } P_att[
 // DM_VK_TEXTURE_BARRIER: 0 legacy (default), 1 metadata observation, 2 guarded
 // deferral. Whole-storage checks conservatively include every mip and layer.
 static int g_tb_mode, g_tb_pass_unsafe, g_tb_this_unsafe;
+static uint32_t g_tb_draw_limit = 128;   // bounded policy, independent of command-buffer/LRZ cut rules
 static vk_tb_state g_tb;
 extern uint64_t g_tex_gen, g_pkg_n;
 uint32_t vk_pool_gen(void);
@@ -379,10 +380,16 @@ static int texture_barrier_end(enum vk_pass_end_reason reason, uint32_t mask) {
 }
 static void texture_barrier_config(void) {
     const char *e = getenv("DM_VK_TEXTURE_BARRIER"); int mode = e ? atoi(e) : 0; if (mode < 0 || mode > 2) mode = 0;
-    if (mode != g_tb_mode) {
-        texture_barrier_flush(TB_NATURAL); g_tb_mode = mode;
+    // DQB2 gameplay hit the conservative 128-draw limit ~6.11 times/frame.
+    // Longer windows still check every read/writer/epoch; never allow unlimited
+    // deferral or change the separate command-buffer/depth safety protections.
+    const char *d = getenv("DM_VK_TEXTURE_BARRIER_DRAWS"); char *end = NULL;
+    long limit = d ? strtol(d, &end, 10) : 128;
+    if (!d || end == d || *end || limit < 128 || limit > 512) limit = 128;
+    if (mode != g_tb_mode || (uint32_t)limit != g_tb_draw_limit) {
+        texture_barrier_flush(TB_NATURAL); g_tb_mode = mode; g_tb_draw_limit = (uint32_t)limit;
         memset(g_tb_stats, 0, sizeof g_tb_stats); g_tb_since = g_tex_frame; g_tb_report = UINT64_MAX;
-        VKLOG("texture barrier mode %d: 0 legacy, 1 observe, 2 guarded deferral", mode);
+        VKLOG("texture barrier mode %d: 0 legacy, 1 observe, 2 guarded deferral; max draws %u", mode, g_tb_draw_limit);
     }
     if (!mode || !g_tex_frame || g_tex_frame % 600 || g_tb_report == g_tex_frame) return;
     g_tb_report = g_tex_frame;
@@ -414,7 +421,7 @@ static int texture_barrier_try(uint32_t bits) {
         return 0;
     }
     if (g_tb_pass_unsafe) { g_tb_stats[TB_WRITER]++; vk_tb_clear(&g_tb); return 0; }
-    if (g_pass_draws >= 128) { g_tb_stats[TB_LIMIT]++; return 0; }
+    if (g_pass_draws >= g_tb_draw_limit) { g_tb_stats[TB_LIMIT]++; return 0; }
     if (!g_tb.pending) {
         vk_tb_state next = {0}; tb_epoch before = texture_barrier_epoch();
         for (int i = 0; i < 9; i++) if (P_att[i].im) {
@@ -477,7 +484,7 @@ static void texture_barrier_before_draw(uint64_t ibuf, uint64_t ibytes, int indi
     if (!g_tb.pending) return;
     if (g_tb_this_unsafe) { texture_barrier_flush(TB_WRITER); return; }
     if (!texture_barrier_epoch_ok()) { texture_barrier_flush(TB_EPOCH); return; }
-    if (g_tb.draws >= 128) { texture_barrier_flush(TB_LIMIT); return; }
+    if (g_tb.draws >= g_tb_draw_limit) { texture_barrier_flush(TB_LIMIT); return; }
     int hazard = ibuf ? texture_barrier_buffer(ibuf, ibytes, 0) : 0;
     uint32_t used = 0, input = S.sh[0]->local[0];
     for (int loc = 0; loc < 16; loc++) if (input >> loc & 1) used |= 1u << ((S.vattr[loc] >> 16) & 15);
@@ -555,6 +562,7 @@ void vk_lrz_forget(vkimg_t *im) { if (g_lrz_prev == im) g_lrz_prev = NULL; }   /
 // 0: no pass could be begun (no render pass or framebuffer, and no dynamic rendering to fall back on): the caller records nothing that needs one
 static int pass_commit(void) {
     if (S.pass_open != 2) return S.pass_open == 1;
+    if (V.image_audit) for (int i = 0; i < 9; i++) if (P_att[i].im) vk_image_audit(P_att[i].im, (VkFormat)P_att[i].fmt);
     vkimg_t *dim = S.daspect ? P_att[8].im : NULL;
     if (g_lrz_touch && dim && g_lrz_prev && g_lrz_prev != dim) lrz_touch(g_lrz_prev, 1, VK_PC_LRZ_SWITCH);
     if (dim) g_lrz_prev = dim;
@@ -2337,7 +2345,8 @@ static void dispatch(const p_dispatch *d) {
     }
     if (p == (void *)1) return;
     uint32_t segment = vk_gpu_segment_begin(VK_GS_COMPUTE, cs->key, (uint32_t)d->x, (uint32_t)d->y);
-    vk_img_barrier_all(cb);
+    if (g_x_nodispbar) vk_img_barrier_all(cb);   // narrowed inputs require the full output dependency
+    else vk_barrier_before(cb, d->ind ? VK_BEFORE_COMPUTE_INDIRECT : VK_BEFORE_COMPUTE);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, (uint32_t)cs->ndyn, dofs);
     void vk_pass_ts(int end, uint32_t w, uint32_t h, uint32_t fmt, uint32_t draws); vk_pass_ts(0, 0, 0, 0, 0);   // DM_VK_PASS_TIMES: dispatches are timed as passes
@@ -2369,7 +2378,7 @@ static void copy_b2t(const p_copy_b2t *c, int to_texture) {
     if (!im || !f) return;
     VkBuffer b; VkDeviceSize o;
     if (!vk_buf_at(c->src, 1, &b, &o)) { VKRED_ONCE(70, "buffer of a buffer ↔ texture copy outside the memory pools"); return; }
-    VkCommandBuffer cb = vk_cmd(); vk_tex_prepare(cb, im); vk_img_barrier_all(cb);
+    VkCommandBuffer cb = vk_cmd(); vk_tex_prepare(cb, im); vk_barrier_before(cb, VK_BEFORE_TRANSFER);
     unsigned bw = f->bw ? f->bw : 1, bh = f->bh ? f->bh : 1;
     uint32_t rowlen = S.row_stride > 0 && f->bpb ? (uint32_t)(S.row_stride / f->bpb) * bw : 0;
     uint32_t imgh = S.image_stride > 0 && S.row_stride > 0 ? (uint32_t)(S.image_stride / S.row_stride) * bh : 0;

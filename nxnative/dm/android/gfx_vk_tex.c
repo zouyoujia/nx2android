@@ -196,6 +196,36 @@ static VkFormat srgb_twin(VkFormat f) {
 // Graveyard Keeper 2, Advance Wars and DKCR drew the same pictures. A colour view in another format than the image's and its twin is logged [RED] (vk_tex_view):
 // such a game wants DM_VK_UBWC=2 in its profile
 static int ubwc_mode(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_VK_UBWC"); v = e ? atoi(e) : 3; } return v; }
+// Called only for actual render attachments. Bounded, read-only and off by
+// default: listed formats and allocation size alone do not establish UBWC use.
+// Query colour and single-aspect depth/stencil only; combined depth/stencil
+// aspect reporting is deliberately left unknown rather than guessing a plane.
+void vk_image_audit(vkimg_t *im, VkFormat view_fmt) {
+    static unsigned n;
+    if (!V.image_audit || !im || !im->img || im->audit_view_fmt == view_fmt || n >= 96) return;
+    im->audit_view_fmt = view_fmt; n++;
+    VkMemoryRequirements rq; vkGetImageMemoryRequirements(V.dev, im->img, &rq);
+    uint32_t flags = UINT32_MAX, rate = UINT32_MAX;
+    if (V.compression_query && im->aspect && !(im->aspect & (im->aspect - 1))) {
+        VkImageSubresource2EXT sr = {VK_STRUCTURE_TYPE_IMAGE_SUBRESOURCE_2_EXT, NULL, {im->aspect, 0, 0}};
+        VkImageCompressionPropertiesEXT cp = {VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_PROPERTIES_EXT, NULL, UINT32_MAX, UINT32_MAX};
+        VkSubresourceLayout2EXT lo = {VK_STRUCTURE_TYPE_SUBRESOURCE_LAYOUT_2_EXT, &cp};
+        V.compression_query(V.dev, im->img, &sr, &lo); flags = cp.imageCompressionFlags; rate = cp.imageCompressionFixedRateFlags;
+        // OPTIMAL tiling pitches are undefined: do not read lo.subresourceLayout.
+    }
+    VKLOG("image audit target %ux%u image %p format %d view %d twin %d listed %d usage %#x create %#x aspect %#x samples %u levels %u layers %u layout %d memory %llu; compression %s flags %#x fixed_rate %#x (driver controls, not compression ratio)",
+        im->w, im->h, (void *)im->img, im->fmt, view_fmt, im->fmt2, im->fixed_fmt, im->usage, im->cflags, im->aspect, im->samples, im->levels, im->layers, im->layout,
+        (unsigned long long)rq.size, flags == UINT32_MAX ? "unknown" : flags == VK_IMAGE_COMPRESSION_DISABLED_EXT ? "disabled" : flags == VK_IMAGE_COMPRESSION_DEFAULT_EXT ? "default" : "fixed-rate", flags, rate);
+}
+static int image_storage_usage(const tex_t *t, const VkFormatProperties *fp) {
+    if (!(t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) || !(fp->optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) return 0;
+    // PJD110: 29/36 targets requested STORAGE, but 2107 bundled shaders had
+    // no image bindings. Only the complete immutable interface can prove it unused.
+    const char *e = getenv("DM_VK_IMAGE_USAGE_TRIM");
+    if (!t->pool || !e || atoi(e) != 1 || vk_shader_storage_images()) return 1;
+    static uint64_t n; n++; if (n <= 4 || !(n % 64)) VKLOG("image usage trim: %llu guest images omit unused STORAGE; bundle has no storage-image interface (compression benefit not inferred)", (unsigned long long)n);
+    return 0;
+}
 static vkimg_t *img_new(const tex_t *t, const vkfmt_t *f) {
     vkimg_t *im = calloc(1, t->pool ? sizeof(pool_image) : sizeof *im);
     const nvn_texdesc *d = &t->d;
@@ -207,7 +237,7 @@ static vkimg_t *img_new(const tex_t *t, const vkfmt_t *f) {
     VkImageUsageFlags u = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) u |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     if (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) u |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-    if ((d->flags & NVN_TEXTURE_FLAGS_IMAGE) && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) u |= VK_IMAGE_USAGE_STORAGE_BIT;
+    if (image_storage_usage(t, &fp)) u |= VK_IMAGE_USAGE_STORAGE_BIT;
     // a block-compressed texture can be drawn into through a view in the uncompressed format of its block size (Mario Kart 8 Deluxe writes BC3 blocks into its
     // reflection cubemaps through RGBA32UI views): with EXTENDED_USAGE the image may carry a usage its own format lacks, and an attachment view needs it on the image
     if (f->compressed && !f->dec && (f->bpb == 16 || f->bpb == 8)) { VkFormatProperties up; vkGetPhysicalDeviceFormatProperties(V.pd, f->bpb == 16 ? VK_FORMAT_R32G32B32A32_UINT : VK_FORMAT_R32G32_UINT, &up);
@@ -545,10 +575,24 @@ static pthread_mutex_t g_view_mu = PTHREAD_MUTEX_INITIALIZER;
 extern uint64_t g_tex_gen;
 static void vk_tex_view_drop_all(vkimg_t *im) {
     pthread_mutex_lock(&g_view_mu);
+    if (im->full) { vk_defer_free_view(im->full); im->full = VK_NULL_HANDLE; }
     vview *v = nvn_hm_get(&g_views, &im); __atomic_fetch_add(&g_tex_gen, 1, __ATOMIC_RELEASE);
     while (v) { vview *n = v->next; vk_defer_free_view(v->v); free(v); v = n; }
     nvn_hm_del(&g_views, &im);
     pthread_mutex_unlock(&g_view_mu);
+}
+VkImageView vk_present_view(vkimg_t *im) {
+    if (!im || !(im->usage & VK_IMAGE_USAGE_SAMPLED_BIT) || im->aspect != VK_IMAGE_ASPECT_COLOR_BIT || im->samples != 1 || im->layers != 1 || im->d != 1 || im->vtype != VK_IMAGE_VIEW_TYPE_2D) return VK_NULL_HANDLE;
+    pthread_mutex_lock(&g_view_mu);
+    if (!im->full) {
+        VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(V.pd, im->fmt, &fp);
+        if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)) { pthread_mutex_unlock(&g_view_mu); return VK_NULL_HANDLE; }
+        VkImageViewUsageCreateInfo usage = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO, NULL, VK_IMAGE_USAGE_SAMPLED_BIT};
+        VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &usage, 0, im->img, VK_IMAGE_VIEW_TYPE_2D, im->fmt, {0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        VkImageView view = VK_NULL_HANDLE;
+        if (vkCreateImageView(V.dev, &ci, NULL, &view) == VK_SUCCESS) im->full = view;
+    }
+    VkImageView view = im->full; pthread_mutex_unlock(&g_view_mu); return view;
 }
 static VkComponentSwizzle swz_comp(int nvn) {   // NVN swizzle enum: 0 zero 1 one 2 R 3 G 4 B 5 A
     switch (nvn) { case 0: return VK_COMPONENT_SWIZZLE_ZERO; case 1: return VK_COMPONENT_SWIZZLE_ONE; case 2: return VK_COMPONENT_SWIZZLE_R; case 3: return VK_COMPONENT_SWIZZLE_G; case 4: return VK_COMPONENT_SWIZZLE_B; default: return VK_COMPONENT_SWIZZLE_A; }
@@ -624,7 +668,7 @@ VkImageView vk_tex_view(const tex_t *t, const view_t *vw, int dim, int arrayed, 
     VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(V.pd, fmt, &fp);
     uci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (as_attachment) uci.usage = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0) | (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : 0);
-    else if ((t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) uci.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    else if ((im->usage & VK_IMAGE_USAGE_STORAGE_BIT) && (t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) uci.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
     VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &uci, 0, im->img, type, fmt, swz, {aspect, lv0, nlv, ly0, nly}};
     VkImageView view; VkResult r = vkCreateImageView(V.dev, &ci, NULL, &view);
     if (r) { pthread_mutex_unlock(&g_view_mu); VKRED_ONCE(15, "vkCreateImageView failed (%d): type %d format %d levels %u+%u layers %u+%u of image %ux%ux%u", r, type, fmt, lv0, nlv, ly0, nly, im->w, im->h, im->layers); return VK_NULL_HANDLE; }

@@ -34,6 +34,13 @@ static pthread_mutex_t g_sub_lock = PTHREAD_MUTEX_INITIALIZER;   // backend subm
 static uint64_t g_queue_serial, g_queue_idle_serial;
 static uint32_t g_timestamp_bits;
 static uint64_t g_cur_frame;
+static uint64_t g_eff[VK_EFF_N];
+static int efficiency_enabled(void) {
+    static int cached = -1; int on = __atomic_load_n(&cached, __ATOMIC_ACQUIRE);
+    if (on < 0) { const char *e = getenv("DM_VK_EFFICIENCY_PROF"); on = e && atoi(e); __atomic_store_n(&cached, on, __ATOMIC_RELEASE); }
+    return on;
+}
+static void efficiency_add(int k, uint64_t n) { if (efficiency_enabled()) __atomic_fetch_add(&g_eff[k], n, __ATOMIC_RELAXED); }
 void vk_queue_changed(void) { g_queue_serial++; }   // g_vk_queue_mu held, including present-thread work
 
 // DM_VK_MEM_DIAG=1 at startup: observe copied-pool costs without changing memory protection or rendering.
@@ -246,6 +253,9 @@ void vk_init(void) {
                           "VK_EXT_robustness2", "VK_EXT_depth_clip_control", "VK_EXT_provoking_vertex", "VK_EXT_index_type_uint8", "VK_EXT_transform_feedback",
                           "VK_GOOGLE_display_timing"};
     const char *on[64]; uint32_t non = 0;
+    { const char *e = getenv("DM_VK_IMAGE_AUDIT"); V.image_audit = e && atoi(e) > 0; }
+    int compression_ext = V.image_audit && has_ext(ex, ne, "VK_EXT_image_compression_control");
+    if (compression_ext) on[non++] = "VK_EXT_image_compression_control";   // read-only queries; no compression control/quality override
     for (unsigned i = 0; i < sizeof want / sizeof *want; i++) if (has_ext(ex, ne, want[i])) on[non++] = want[i]; else VKLOG("device has no %s", want[i]);
     // A Vulkan 1.1 or 1.2 device (Legion Y700 2023, Adreno 730: its stock driver reports 1.1) has what the replay uses from 1.2 / 1.3 as extensions: they are enabled
     // when present, so the features chained below and the functions loaded by their KHR names are valid there. A 1.3 device needs none of them
@@ -351,6 +361,9 @@ void vk_init(void) {
     vkGetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)p_vkGetInstanceProcAddr(V.inst, "vkGetDeviceProcAddr");
 #define VK_LOADD(f) f = (PFN_##f)vkGetDeviceProcAddr(V.dev, #f); if (!f) f = (PFN_##f)vkGetDeviceProcAddr(V.dev, #f "KHR"); if (!f) f = (PFN_##f)p_vkGetInstanceProcAddr(V.inst, #f);   // a promoted function by its extension's name (Vulkan 1.1 / 1.2 devices)
     VK_DEV_FNS(VK_LOADD)
+    if (compression_ext) V.compression_query = (PFN_vkGetImageSubresourceLayout2EXT)vkGetDeviceProcAddr(V.dev, "vkGetImageSubresourceLayout2EXT");
+    if (V.image_audit) VKLOG("image audit: compression query %s; default compression policy unchanged; allocation size is not proof of compression",
+        V.compression_query ? "available" : "unavailable (extension or entry point missing)");
     // A driver can report the timeline-semaphore feature (and Vulkan 1.3) and still export no vkWaitSemaphores: the emulator's ranchu / gfxstream driver does
     // (both the device and the instance dispatcher return null for it and for vkGetSemaphoreCounterValue), and the first wait then called address 0
     // (SIGSEGV pc=0, lr=wait_fence+0x70, thread 'dm-vk-complete', South Park: The Stick of Truth). The feature query is not proof the entry points load:
@@ -1033,20 +1046,22 @@ static int completion_wait(uint64_t fence, uint64_t timeout_ns, int reusable) {
     // expired pthread_cond_timedwait calls still slept/woke on Bionic. Do not take
     // the mutex, read the wall clock or enter a condition wait in the fast path.
     if (!timeout_ns) {
-        __atomic_fetch_add(&g_poll_zero, 1, __ATOMIC_RELAXED);
+        if (g_sync_prof) __atomic_fetch_add(&g_poll_zero, 1, __ATOMIC_RELAXED);
         if (__atomic_load_n(&g_poll_fast, __ATOMIC_ACQUIRE)) {
             uint64_t passed = __atomic_load_n(reusable ? &g_slot_ready : &g_done, __ATOMIC_ACQUIRE);
-            __atomic_fetch_add(&g_poll_fast_queries, 1, __ATOMIC_RELAXED);
-            if (passed < fence) __atomic_fetch_add(&g_poll_pending, 1, __ATOMIC_RELAXED);
+            // Poll counters are consumed only by sync_report. Keep diagnostics
+            // disabled off the hot path (gameplay can poll thousands of times).
+            if (g_sync_prof) { __atomic_fetch_add(&g_poll_fast_queries, 1, __ATOMIC_RELAXED);
+                if (passed < fence) __atomic_fetch_add(&g_poll_pending, 1, __ATOMIC_RELAXED); }
             return passed >= fence;
         }
-    } else __atomic_fetch_add(&g_poll_positive, 1, __ATOMIC_RELAXED);
+    } else if (g_sync_prof) __atomic_fetch_add(&g_poll_positive, 1, __ATOMIC_RELAXED);
     struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl);
     uint64_t ns = (uint64_t)dl.tv_nsec + (timeout_ns > 3600ull * 1000000000ull ? 3600ull * 1000000000ull : timeout_ns);
     dl.tv_sec += (time_t)(ns / 1000000000ull); dl.tv_nsec = (long)(ns % 1000000000ull);
     pthread_mutex_lock(&g_done_mu); uint64_t *passed = reusable ? &g_slot_ready : &g_done;
     int blocked = *passed < fence; uint64_t measure = blocked ? sync_clock() : 0;
-    if (blocked) {
+    if (blocked && g_sync_prof) {
         if (!timeout_ns) { __atomic_fetch_add(&g_poll_pending, 1, __ATOMIC_RELAXED); __atomic_fetch_add(&g_poll_legacy_cond, 1, __ATOMIC_RELAXED); }
         else __atomic_fetch_add(&g_poll_positive_blocked, 1, __ATOMIC_RELAXED);
     }
@@ -1146,6 +1161,7 @@ static void vk_cmd_split_(void) {
             gpu_segment_cpu(3); pthread_mutex_lock(&g_vk_queue_mu); vk_queue_changed(); VkResult r = vkQueueSubmit(V.q, 1, &si, VK_NULL_HANDLE); pthread_mutex_unlock(&g_vk_queue_mu); gpu_segment_cpu(4);
             if (r) { void vk_crumbs_report(void); vk_crumbs_report(); die("[vk] vkQueueSubmit (part): %d (device lost?)", r); }
             { static int n; if (n++ < 3) VKLOG("a long submission: part %d sent early", s->nmain_used); }
+            efficiency_add(VK_EFF_EARLY, 1); efficiency_add(VK_EFF_MAIN, 1); efficiency_add(VK_EFF_UPLOAD, s->up_used != 0);
             s->nmain_sent = s->nmain_used;
             if (s->up_used) {   // the next part records its uploads into a fresh upload buffer
                 if (s->nup_used == s->nup_alloc) { VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, s->pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1};
@@ -1339,13 +1355,37 @@ void vk_img_barrier_all(VkCommandBuffer cb) {
     vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &b, 0, NULL, 0, NULL);
     vk_gpu_segment_end(token, 1);
 }
+// The old input barrier waits every stage even when only a transfer/dispatch
+// follows. Narrow its consumer side only; keep the full barrier AFTER the
+// operation, including indirect argument reads in the compute input scope.
+void vk_barrier_before(VkCommandBuffer cb, int kind) {
+    const char *e = getenv("DM_VK_SCOPED_BARRIERS"); vk_before_scope scope = vk_before_scope_for(kind);
+    if (!e || atoi(e) != 1 || !scope.stage) { efficiency_add(VK_EFF_FULL_INPUT, 1); vk_img_barrier_all(cb); return; }
+    uint32_t token = vk_gpu_segment_begin(VK_GS_BARRIER, (uint64_t)kind + 1, 0, 0);
+    VkMemoryBarrier b = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, scope.access};
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, scope.stage, 0, 1, &b, 0, NULL, 0, NULL);
+    vk_gpu_segment_end(token, 1); efficiency_add(VK_EFF_SCOPED_INPUT, 1);
+}
+void vk_efficiency_present(uint64_t frame) {
+    if (frame % 300) return;
+    if (!efficiency_enabled()) return;
+    static uint64_t last[VK_EFF_N], at; uint64_t now[VK_EFF_N];
+    for (int i = 0; i < VK_EFF_N; i++) now[i] = __atomic_load_n(&g_eff[i], __ATOMIC_RELAXED);
+    if (at && frame > at) VKLOG("efficiency frames %llu..%llu: early submits %llu final submits %llu main CBs %llu upload CBs %llu; input barriers full %llu scoped %llu; command resets %llu unused resets avoided %llu",
+        (unsigned long long)at, (unsigned long long)frame,
+        (unsigned long long)(now[VK_EFF_EARLY] - last[VK_EFF_EARLY]), (unsigned long long)(now[VK_EFF_FINAL] - last[VK_EFF_FINAL]),
+        (unsigned long long)(now[VK_EFF_MAIN] - last[VK_EFF_MAIN]), (unsigned long long)(now[VK_EFF_UPLOAD] - last[VK_EFF_UPLOAD]),
+        (unsigned long long)(now[VK_EFF_FULL_INPUT] - last[VK_EFF_FULL_INPUT]), (unsigned long long)(now[VK_EFF_SCOPED_INPUT] - last[VK_EFF_SCOPED_INPUT]),
+        (unsigned long long)(now[VK_EFF_RESETS] - last[VK_EFF_RESETS]), (unsigned long long)(now[VK_EFF_UNUSED_RESETS] - last[VK_EFF_UNUSED_RESETS]));
+    memcpy(last, now, sizeof last); at = frame;
+}
 void vk_gpu_wrote(uint64_t a, uint64_t n);
 void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
     VkBuffer sb, db; VkDeviceSize so, dof;
     if (!n) return;
     if (!vk_buf_at(src, n, &sb, &so) || !vk_buf_at(dst, n, &db, &dof)) { VKRED_ONCE(1, "buffer copy outside the memory pools (%#llx → %#llx, %llu bytes)", (unsigned long long)src, (unsigned long long)dst, (unsigned long long)n); return; }
     vk_end_pass_land_reason(VK_PASS_END_BUFFER_COPY);
-    VkCommandBuffer cb = vk_cmd(); vk_img_barrier_all(cb);
+    VkCommandBuffer cb = vk_cmd(); vk_barrier_before(cb, VK_BEFORE_TRANSFER);
     VkBufferCopy r = {so, dof, n}; vkCmdCopyBuffer(cb, sb, db, 1, &r);
     vk_img_barrier_all(cb); vk_gpu_wrote(dst, n);
 }
@@ -1354,7 +1394,7 @@ void mtl_sub_fill(uint64_t dst, uint64_t n, uint32_t value) {
     if (!n) return;
     if (!vk_buf_at(dst, n, &db, &dof)) { VKRED_ONCE(2, "buffer fill outside the memory pools"); return; }
     vk_end_pass_land_reason(VK_PASS_END_BUFFER_FILL);
-    VkCommandBuffer cb = vk_cmd(); vk_img_barrier_all(cb);
+    VkCommandBuffer cb = vk_cmd(); vk_barrier_before(cb, VK_BEFORE_FILL);
     vkCmdFillBuffer(cb, db, dof, n & ~3ull, value);
     vk_img_barrier_all(cb); vk_gpu_wrote(dst, n);
 }
@@ -1511,8 +1551,15 @@ static void completion_retire(cpend *c) {
     uint64_t measure = sync_clock();
     if (g_prereset > 0 && c->rslot >= 0) { vksub_t *s = &g_slot[c->rslot];
         if (s->fence == c->fence) {
-            for (int i = 0; i < s->nmain_alloc; i++) VKCHK(vkResetCommandBuffer(s->mains[i], 0));
-            for (int i = 0; i < s->nup_alloc; i++) VKCHK(vkResetCommandBuffer(s->ups[i], 0));
+            // Slot reuse waited for the previous retirement before recording. An
+            // allocated buffer unused by this submission is already INITIAL;
+            // resetting the historical high-water allocation repeats driver work.
+            // nup_used conservatively includes the trailing, possibly unbegun
+            // upload buffer, including refused-submission recovery paths.
+            for (int i = 0; i < s->nmain_used; i++) VKCHK(vkResetCommandBuffer(s->mains[i], 0));
+            for (int i = 0; i < s->nup_used; i++) VKCHK(vkResetCommandBuffer(s->ups[i], 0));
+            efficiency_add(VK_EFF_RESETS, s->nmain_used + s->nup_used);
+            efficiency_add(VK_EFF_UNUSED_RESETS, s->nmain_alloc - s->nmain_used + s->nup_alloc - s->nup_used);
         }
     }
     sync_add(SP_RESET, measure);
@@ -1598,6 +1645,7 @@ uint64_t mtl_sub_commit(void) {
     gpu_segment_cpu(3); struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0); uint64_t measure = sync_clock(); pthread_mutex_lock(&g_vk_queue_mu); sync_add(SP_LOCK, measure); measure = sync_clock(); vk_queue_changed(); VkResult r = vkQueueSubmit(V.q, 1, &si, fe); sync_add(SP_SUBMIT, measure); pthread_mutex_unlock(&g_vk_queue_mu); clock_gettime(CLOCK_MONOTONIC, &t1); g_ns_submit += (uint64_t)((t1.tv_sec - t0.tv_sec) * 1000000000ll + (t1.tv_nsec - t0.tv_nsec));
     if (r) { void vk_crumbs_report(void); vk_crumbs_report(); die("[vk] vkQueueSubmit: %d (device lost?)", r); }
     gpu_segment_cpu(4); kgsl_perf_submitted();
+    efficiency_add(VK_EFF_FINAL, 1); efficiency_add(VK_EFF_MAIN, s->nmain_used - s->nmain_sent); efficiency_add(VK_EFF_UPLOAD, s->up_used != 0);
     s->fence = f;
     cpend *c = calloc(1, sizeof *c); c->fence = f; c->frame = __atomic_load_n(&g_cur_frame, __ATOMIC_RELAXED); c->n = s->npost; c->rslot = g_cur; c->slot = s->no_ts ? -1 : g_cur; s->no_ts = 0;
     c->segments = gpu_segment_snapshot(er < 0);
