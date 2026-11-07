@@ -37,6 +37,7 @@ class TextureBarrier(unittest.TestCase):
         self.compile_run(r'''
 #include <assert.h>
 #include "texture_barrier.h"
+#include "gfx_vk_slot.h"
 int main(void){
     vk_tb_range a,b;assert(vk_tb_range_make(&a,0x10000,0x1000,1,0x2000));
     assert(vk_tb_range_make(&b,0x20000,0x1000,2,0x2000) && !vk_tb_overlap(&a,&b));
@@ -79,6 +80,7 @@ int main(void){
 #include <string.h>
 #include "nvn_obj.h"
 #include "texture_barrier.h"
+#include "gfx_vk_slot.h"
 #include "pass_census.h"
 '''+kinds+'\n'+desc+'\n'+binding+r'''
 #define VKLOG(...) do {if(0)fprintf(stderr,__VA_ARGS__);} while(0)
@@ -86,7 +88,7 @@ typedef struct {int nbind,xfb;const dmsv_bind *b;uint32_t local[3];} vkshader_t;
 typedef struct {uint64_t pool;int64_t off,size;} vkimg_t;
 typedef struct {uint64_t lo,hi;VkBuffer buf;int flags,lazy;} vkpool_t;
 static struct {int pass_open,rast_discard,rp_pass;VkPipeline bound_pipe;uint32_t pass_w,pass_h,cfmt[8];
-    vkshader_t *sh[6];tex_t rt_col[8],rt_dep;p_bind_buf ubo[6][16];NVNbufferRange vbuf[16];uint32_t vattr[16];uint64_t tex[6][256];} S;
+    vkshader_t *sh[6];tex_t rt_col[8],rt_dep;p_bind_buf ubo[6][16];NVNbufferRange vbuf[16];uint32_t vattr[16];uint64_t tex[6][256],img[6][32];} S;
 static struct {vkimg_t *im;} P_att[9];
 static struct {struct {struct {uint64_t minUniformBufferOffsetAlignment;} limits;} props;} V;
 static int g_tf_on,g_tf_in_pass,g_x_listpasses,g_x_skip_empty_barrier=1,g_x_tracepass=-1,g_sub_pass,g_lin_back,P_cleared;
@@ -178,6 +180,12 @@ int main(void){
     reset(2);S.rt_col[0].mem=(void *)(uintptr_t)0x100120;S.rt_col[0].L.size=32;attachment.size=32;
     S.ubo[0][0]=(p_bind_buf){0,0,0x100140,32};deferred();texture_barrier_before_draw(0,0,0);flushed(TB_BUF_ALIAS);
     reset(2);deferred();texture_barrier_before_draw(0,0,1);flushed(TB_WRITER);
+    // Source #143: slots 32..39 may be sourced from image slots, but are still
+    // sampled reads. The guard must resolve exactly the same handle as replay.
+    reset(2);fsbind[0].reg=32;S.tex[1][32]=1;S.img[1][0]=2;deferred();texture_barrier_before_draw(0,0,0);flushed(TB_TEX_ALIAS);
+    reset(2);fsbind[0].reg=32;S.tex[1][32]=2;S.img[1][0]=1;deferred();texture_barrier_before_draw(0,0,0);assert(g_tb.pending && !ends);
+    S.img[1][0]=2;texture_barrier_before_draw(0,0,0);flushed(TB_TEX_ALIAS);
+    reset(2);fsbind[0].reg=32;S.tex[1][32]=2;S.img[1][0]=0;deferred();texture_barrier_before_draw(0,0,0);flushed(TB_TEX_ALIAS);
     // No sparse, virtual, unknown-size or mismatched-image source is retained.
     reset(2);S.rt_col[0].d.flags=NVN_TEXTURE_FLAGS_SPARSE;assert(!texture_barrier_try(0x10));
     reset(2);pools[0].flags=NVN_MEMORY_POOL_FLAGS_VIRTUAL;assert(!texture_barrier_try(0x10));

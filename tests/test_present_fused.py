@@ -104,3 +104,22 @@ int main(void){
  return 0;
 }
 ''')
+
+    def test_imported_undefined_source_keeps_original_transition_path(self):
+        source=(DM/'android/gfx_vk_present.c').read_text()
+        tb.TextureBarrier.compile_run(self,r'''
+#define VK_NO_PROTOTYPES
+#include <vulkan/vulkan_core.h>
+#include <assert.h>
+#include "present_geometry.h"
+typedef struct{VkFormat fmt;uint32_t w,h;VkImageLayout layout;}vkimg_t;
+static struct{int has_dynrender;}V={1};static VkExtent2D g_sext={3168,1440};static VkSurfaceTransformFlagBitsKHR g_pre=VK_SURFACE_TRANSFORM_ROTATE_90_BIT_KHR;
+static int setups,views;static int direct_wanted(void){return 1;}static int direct_setup(void){setups++;return 1;}static int vk_window_bottom_up(void){return 0;}static VkImageView vk_present_view(vkimg_t *im){assert(im->layout==VK_IMAGE_LAYOUT_GENERAL);views++;return(VkImageView)(uintptr_t)1;}
+''' + tb.function(source,'direct_source') + r'''
+int main(void){
+ vkimg_t im={VK_FORMAT_R8G8B8A8_UNORM,1920,1080,VK_IMAGE_LAYOUT_UNDEFINED};vk_present_quad q;VkImageView view=VK_NULL_HANDLE;
+ assert(!direct_source(&im,NULL,&q,&view) && !setups && !views); // imported GL frame must take upstream's first-use transition
+ im.layout=VK_IMAGE_LAYOUT_GENERAL;assert(direct_source(&im,NULL,&q,&view) && setups==1 && views==1 && q.turn==1);
+ return 0;
+}
+''')

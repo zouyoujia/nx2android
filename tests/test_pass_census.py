@@ -78,7 +78,9 @@ static int P_cleared,g_x_listpasses,g_x_tracepass=-1,g_sub_pass,g_lin_back=1,g_t
 static uint64_t g_pass_draws;static int32_t g_pass_bb[4];
 static int commit_ok=1,commit_calls,rp_ends,dyn_ends,timestamps,dumps,backs,crumbs,land_calls,sub_open=1;
 static int g_x_nokeep,rt_matches=1,rt_checks;static struct {uint64_t rt_kept;} g_vkst;
-typedef struct {int dummy;} p_set_rt;
+#define MAGIC(a,b,c,d) ((uint32_t)(a)|((uint32_t)(b)<<8)|((uint32_t)(c)<<16)|((uint32_t)(d)<<24))
+typedef struct {uint32_t magic;uint64_t serial;void *mem;} tex_t;
+typedef struct {int dummy,n;const tex_t *color[8],*depth;} p_set_rt;
 static int rt_same(const p_set_rt *r){assert(r);rt_checks++;return rt_matches;}
 typedef struct {void *dli_fbase;} Dl_info;
 static int dladdr(void *symbol,Dl_info *info){(void)symbol;info->dli_fbase=NULL;return 0;}

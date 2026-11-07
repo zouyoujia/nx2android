@@ -27,6 +27,7 @@ typedef struct {int is_int,is_sint;} vkfmt_t;
 static struct {int pass_open,ncol;struct {uint32_t mask;} chmask;VkFormat cfmt[8];
  int rt_has_cview[8];struct {int set_format,format;} rt_cview[8];struct {struct {int format;} d;} rt_col[8];} S;
 static VkImageView P_alias_views[8];static uint8_t P_alias[8];
+static VkRenderingInfo P_ri;static uint32_t cleared_layers;
 static VkRenderingAttachmentInfo P_ca[8];static int P_cleared,ended,clears;static uint32_t cleared_slot;
 static struct {unsigned folded;} g_vkst;
 static void vk_end_pass(void) {ended++;S.pass_open=0;}
@@ -38,7 +39,7 @@ static int pass_whole(VkRect2D r) {return r.extent.width==100;}
 static const vkfmt_t *vk_fmt(int format) {(void)format;return NULL;}
 static VkCommandBuffer vk_cmd(void) {return VK_NULL_HANDLE;}
 static void fake_clear(VkCommandBuffer cb,uint32_t na,const VkClearAttachment *a,uint32_t nr,const VkClearRect *r) {
- (void)cb;(void)nr;(void)r;assert(na==1);clears++;cleared_slot=a->colorAttachment;
+ (void)cb;(void)nr;(void)r;assert(na==1);clears++;cleared_slot=a->colorAttachment;cleared_layers=r->layerCount;
 }
 #define vkCmdClearAttachments fake_clear
 #define VKRED_ONCE(...) ((void)0)
@@ -67,7 +68,7 @@ int main(void) {
  p_clear_color c={4,15,{.25f,.5f,.75f,1}};clear_color(&c);
  assert(P_ca[3].loadOp==VK_ATTACHMENT_LOAD_OP_CLEAR && P_ca[3].clearValue.color.float32[1]==.5f);
  assert(P_cleared && g_vkst.folded==1 && clears==0 && c.index==4);
- S.pass_open=1;clear_color(&c);assert(clears==1 && cleared_slot==3);
+ S.pass_open=1;P_ri.layerCount=4;clear_color(&c);assert(clears==1 && cleared_slot==3 && cleared_layers==4);
  c.index=-1;clear_color(&c);c.index=8;clear_color(&c);assert(clears==1);
  return 0;
 }
