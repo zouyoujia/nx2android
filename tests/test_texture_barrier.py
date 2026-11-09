@@ -219,12 +219,17 @@ int main(void){
     reset(2);g_pass_draws=200;deferred();S.rast_discard=1;texture_barrier_before_draw(0,0,0);flushed(TB_WRITER);
     reset(2);g_pass_draws=200;deferred();texture_barrier_record(OP_DISPATCH,NULL);flushed(TB_OP);
     setenv("DM_VK_TEXTURE_BARRIER_DRAWS","512",1);texture_barrier_config();assert(g_tb_draw_limit==512);
-    const char *invalid[]={"", "0", "-1", "127", "513", "999999999999999999999999", "256junk"};
+    setenv("DM_VK_TEXTURE_BARRIER_DRAWS","1024",1);texture_barrier_config();assert(g_tb_draw_limit==1024);
+    reset(2);g_pass_draws=900;deferred();S.tex[1][0]=2;texture_barrier_before_draw(0,0,0);flushed(TB_TEX_ALIAS);
+    reset(2);g_pass_draws=900;deferred();dirty++;texture_barrier_before_draw(0,0,0);flushed(TB_EPOCH);
+    reset(2);g_pass_draws=900;deferred();S.rast_discard=1;texture_barrier_before_draw(0,0,0);flushed(TB_WRITER);
+    reset(2);g_pass_draws=900;deferred();texture_barrier_record(OP_DISPATCH,NULL);flushed(TB_OP);
+    const char *invalid[]={"", "0", "-1", "127", "1025", "999999999999999999999999", "256junk"};
     for(unsigned i=0;i<sizeof invalid/sizeof invalid[0];i++){setenv("DM_VK_TEXTURE_BARRIER_DRAWS",invalid[i],1);texture_barrier_config();assert(g_tb_draw_limit==128);}
     // Identical 1024 independent draws and 1023 invalidations: production guard
     // and pass-end paths reduce physical ends, not the number of guest draws.
-    for(unsigned limit=128;limit<=256;limit*=2){
-        setenv("DM_VK_TEXTURE_BARRIER_DRAWS",limit==128?"128":"256",1);texture_barrier_config();
+    for(unsigned limit=128;limit<=1024;limit*=2){
+        setenv("DM_VK_TEXTURE_BARRIER_DRAWS",limit==128?"128":limit==256?"256":limit==512?"512":"1024",1);texture_barrier_config();
         reset(2);g_pass_draws=1;unsigned draws=1;
         for(unsigned i=1;i<1024;i++){
             game_barrier(0x10);texture_barrier_before_draw(0,0,0);

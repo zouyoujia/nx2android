@@ -35,9 +35,11 @@ typedef struct { struct { uint64_t lo,hi; } gw[64]; int ngw,readback_ranges; } v
 static vksub_t g_slot[2]; static int g_cur=-1;
 typedef struct { int kind,desc; } binding;
 typedef struct { int nbind; binding b[2]; } vkshader_t;
+static void linear_shader_writes(int st,const vkshader_t *s){(void)st;(void)s;}
 CONTROLS
 RANGES
 static void observe(vkshader_t *s) {
+    int st=0;
 GATE
 }
 int main(void) {

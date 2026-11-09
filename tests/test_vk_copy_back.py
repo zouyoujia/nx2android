@@ -51,7 +51,7 @@ int main(void) {
     def test_protected_pools(self):
         dm = Path(__file__).resolve().parents[1] / 'nxnative/dm'
         dirty = (dm / 'gfx/nvn/nvn_dirty.c').read_text()
-        dirty = '\n'.join(s for s in dirty.splitlines() if not s.startswith('#include'))
+        dirty = '#include "'+str(dm/'gfx/nvn/nvn_dirty.h')+'"\n'+'\n'.join(s for s in dirty.splitlines() if not s.startswith('#include'))
         core = (dm / 'android/gfx_vk_core.c').read_text()
         start = core.index('static void pools_copy_back(const struct vksub *s) {')
         copy_back = core[start:core.index('\n}\n', start) + 3]

@@ -316,7 +316,10 @@ typedef struct vkshader vkshader_t;
 static pthread_mutex_t g_pc_mu=PTHREAD_MUTEX_INITIALIZER;
 static vk_pc_state g_pc;static int g_pc_on=1,g_x_dedup_adj_barrier,g_x_skip_empty_barrier=1;
 static int g_x_listpasses,g_x_tracepass=-1,g_sub_pass,g_lin_back,g_tf_in_pass,P_cleared;
-static int g_rc_skip;static uint32_t g_sub_ops[64];static uint64_t g_ubo_gen[6],g_bind_gen[6];
+static int g_rc_skip,g_vk_cpu_sections;static uint32_t g_sub_ops[64];static uint64_t g_ubo_gen[6],g_bind_gen[6],g_cmd_gen;
+// Default-off CPU diagnostics must not call clocks or counters in this walker.
+static uint64_t tick(void){assert(g_vk_cpu_sections);return 1;}
+static void vk_gpu_cpu_add(unsigned kind,uint64_t ns,uint64_t epoch){(void)kind;(void)ns;(void)epoch;assert(g_vk_cpu_sections);}
 static p_tf_bind g_tf[4];static struct {int has_xfb;} V={1};
 static uint64_t g_pass_draws;static int32_t g_pass_bb[4];
 static unsigned ends,fulls,commits,lands,cmd_queries;static uintptr_t cb_id=7;

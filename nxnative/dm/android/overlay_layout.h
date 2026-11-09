@@ -22,6 +22,9 @@ int dm_overlay_layout(void);   // front_android.c: 0 the tablet's, 1 the phone's
 // front_android.c → gfx_vk_present.c: what to draw (0 nothing: a controller is attached, and its keys open the menu; 1 the gamepad; 2 only the menu
 // button: the player hid the gamepad, or keys came from a device not counted as a controller), where a stick's knob is (its offset from the stick's centre
 // in stick radii, -1..1), and when each control was pressed (0 = not held; for the d-pad, its four directions by DM_BTN_* bit; a stick: while a finger holds it)
+// A balanced scope freezes only this thread's window dimensions for one draw.
+void dm_overlay_metrics_begin(void);
+void dm_overlay_metrics_end(void);
 int dm_overlay_visible(void);
 void dm_overlay_knob(int stick, float *dx, float *dy);
 int64_t dm_overlay_pressed(int ctl, uint64_t bit);   // CLOCK_MONOTONIC ns of the press, 0 = not held

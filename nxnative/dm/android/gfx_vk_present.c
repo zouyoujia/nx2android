@@ -66,6 +66,8 @@ static VkImageView g_sview[8];
 static _Atomic uint32_t g_pic[4] = {0, 0, 1u << 20, 1u << 20};
 static void vk_pic_set(float x, float y, float w, float h) { atomic_store(&g_pic[0], (uint32_t)(x * (1 << 20))); atomic_store(&g_pic[1], (uint32_t)(y * (1 << 20))); atomic_store(&g_pic[2], (uint32_t)(w * (1 << 20))); atomic_store(&g_pic[3], (uint32_t)(h * (1 << 20))); }
 void dm_picture_rect(float r[4]) { for (int i = 0; i < 4; i++) r[i] = (float)atomic_load(&g_pic[i]) / (1 << 20); }
+__attribute__((weak)) void dm_overlay_metrics_begin(void) {}
+__attribute__((weak)) void dm_overlay_metrics_end(void) {}
 __attribute__((weak)) int dm_overlay_visible(void) { return 0; }
 __attribute__((weak)) float dm_overlay_scale(void) { return 1; }
 __attribute__((weak)) void dm_overlay_knob(int stick, float *dx, float *dy) { (void)stick; *dx = *dy = 0; }
@@ -937,6 +939,7 @@ static void present_window(vkimg_t *im, const int crop[4], double period, uint64
     VkCommandBuffer cb = g_pcb[k];
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}; vkBeginCommandBuffer(cb, &bi);
     vk_img_barrier_all(cb);   // after everything submitted before on this queue
+    dm_overlay_metrics_begin();
     int external = dm_external_active();
     int ovm = external ? 0 : dm_overlay_visible(), menu = external ? -1 : dm_menu_state(), fps = dm_overlay_fps();
     if (fused) {
@@ -989,13 +992,14 @@ static void present_window(vkimg_t *im, const int crop[4], double period, uint64
         barrier(cb, g_simg[idx], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     } else barrier(cb, g_simg[idx], lay, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     }
+    dm_overlay_metrics_end();
     vkEndCommandBuffer(cb);
     // The fused path first writes the acquired image as a colour attachment.
     VkPipelineStageFlags ws = fused ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT : VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 1, &g_acq[k], &ws, 1, &cb, 1, &g_done_sem[k]};
     extern pthread_mutex_t g_vk_queue_mu;
     pthread_mutex_lock(&g_vk_queue_mu);
-    vk_queue_changed();
+    vk_queue_changed(); vk_queue_present(ticket);
     if (vkQueueSubmit(V.q, 1, &si, g_pfence[k])) { pthread_mutex_unlock(&g_vk_queue_mu); VKRED_ONCE(91, "present submit failed"); return; }
     { static uint64_t nf, no; if (V.image_audit) { if (fused) nf++; else no++;
       if ((nf + no) % 300 == 0) VKLOG("present work: fused %llu original %llu; fused has one colour pass and no intermediate clear/blit/rotation pass", (unsigned long long)nf, (unsigned long long)no); } }
@@ -1103,7 +1107,7 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     static ANativeWindow *rate_win; static double rate_period, want_period; static uint64_t want_since;
     if (period != want_period) { want_period = period; want_since = g_presents; }
     if (g_win && (g_win != rate_win || (period != rate_period && (period < rate_period || g_presents - want_since >= 60)))) { rate_win = g_win; rate_period = period; dm_perf_window(g_win, period > 0 ? 1.0 / period : 60); }
-    uint64_t n = ++g_presents; vk_efficiency_present(n);
+    uint64_t n = ++g_presents; vk_efficiency_present(n); vk_linear_present(n); vk_bind_batch_report(n); vk_dq_report(n);
     vk_pass_census_report(n);
     // without display times (no VK_GOOGLE_display_timing, no window, or none came back) the hand-over time stands in, as before: the governor's late check needs readings
     { int disp = V.has_dtiming && dm_front_window() && (n <= 240 || g_pres_recorded); struct timespec ts; if (!disp) clock_gettime(CLOCK_MONOTONIC, &ts);

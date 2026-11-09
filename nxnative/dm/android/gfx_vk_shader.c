@@ -4,6 +4,7 @@
 // The translator numbers every stage's bindings from 0 in set 0; at module creation each stage's bindings move to a set of its own (vertex 0, fragment 1,
 // geometry 2, tessellation 3 / 4; compute 0) by rewriting the DescriptorSet decorations, so a program's stages never collide.
 #include "gfx_vk.h"
+#include "linear_shader_writes.h"
 #include "nvn_hmap.h"
 #include "shader_image_usage.h"
 #include "zstd.h"
@@ -300,6 +301,7 @@ static vkshader_t *vk_shader_q(uint64_t key, int stage, int quiet) {
         { uint32_t d = op == 71 && n >= 4 ? w[i + 2] : op == 72 && n >= 5 ? w[i + 3] : 0, v = op == 71 ? w[i + 3] : op == 72 && n >= 5 ? w[i + 4] : 0;
           if (d == 36) xb = v; else if (d == 37 && xb < 4) s->xfb_stride[xb] = v; }
         i += n; }
+    s->linear_writes = vk_linear_shader_class(s->b, s->nbind) | (s->xfb ? 2u : 0);
     // without VK_EXT_transform_feedback the capture declarations would make the module invalid: they are dropped (the capture's draws then write nothing, as before)
     if (s->xfb && !V.has_xfb) { uint32_t o = 5;
         for (uint32_t i = 5; i < nw;) { uint32_t n = w[i] >> 16, op = w[i] & 0xffff; if (!n || i + n > nw) { while (i < nw) w[o++] = w[i++]; break; }

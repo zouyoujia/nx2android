@@ -225,9 +225,28 @@ static _Atomic int64_t g_press_t[16], g_menu_t, g_stick_t[2];   // when each ove
 static uint64_t g_touch_btn;        // the overlay buttons held, as of the last touch event
 static int64_t mono_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec; }
 int dm_overlay_visible(void) { return atomic_load(&g_pads) ? 0 : atomic_load(&g_set_overlay) && atomic_load(&g_overlay) ? 1 : 2; }
+// One overlay draw reads the same window metrics hundreds of times through
+// OV_CTLS/ov_box/pressed helpers. PJD110 gfx tracing observed270 outer queries
+// per presentation recording. Snapshot only this thread's draw; input and the
+// next frame still read the current window. Never retain an ANativeWindow*.
+static _Thread_local unsigned g_ov_metrics_depth;
+static _Thread_local int g_ov_metrics_active, g_ov_metrics_valid, g_ov_metrics_w, g_ov_metrics_h;
+static void overlay_window_size(int *ww, int *wh) {
+    if (g_ov_metrics_active && g_ov_metrics_valid) { *ww = g_ov_metrics_w; *wh = g_ov_metrics_h; return; }
+    ANativeWindow *w = phone_window(); *ww = w ? ANativeWindow_getWidth(w) : 0; *wh = w ? ANativeWindow_getHeight(w) : 0;
+    if (g_ov_metrics_active) { g_ov_metrics_w = *ww; g_ov_metrics_h = *wh; g_ov_metrics_valid = 1; }
+}
+void dm_overlay_metrics_begin(void) {
+    if (g_ov_metrics_depth++) return;
+    const char *e = getenv("DM_OVERLAY_WINDOW_CACHE");
+    g_ov_metrics_active = !(e && !atoi(e)); g_ov_metrics_valid = 0;   // a hidden overlay does not query the window
+}
+void dm_overlay_metrics_end(void) {
+    if (g_ov_metrics_depth && !--g_ov_metrics_depth) g_ov_metrics_active = 0;
+}
 int dm_overlay_layout(void) {   // the phone's layout in a window at least OV_PHONE_ASPECT wide for its height (overlay_layout.h)
-    static int last_w = -1, last_h = -1, phone;
-    ANativeWindow *w = phone_window(); int ww = w ? ANativeWindow_getWidth(w) : 0, wh = w ? ANativeWindow_getHeight(w) : 0;
+    static _Thread_local int last_w = -1, last_h = -1, phone;
+    int ww, wh; overlay_window_size(&ww, &wh);
     if (ww != last_w || wh != last_h) { last_w = ww; last_h = wh; phone = ov_layout_for_size(ww, wh);
         if (wh > 0) LOG("[overlay] window %dx%d: the %s layout", ww, wh, phone ? "phone" : "tablet"); }
     return phone;
@@ -251,8 +270,8 @@ int64_t dm_overlay_pressed(int ctl, uint64_t bit) {
 }
 static int g_dpi;   // the display's density (AConfiguration), 0 = unknown
 float dm_overlay_scale(void) {
-    static int last_w = -1, last_h = -1; static float s = 1;
-    ANativeWindow *w = phone_window(); int ww = w ? ANativeWindow_getWidth(w) : 0, h = w ? ANativeWindow_getHeight(w) : 0;
+    static _Thread_local int last_w = -1, last_h = -1; static _Thread_local float s = 1;
+    int ww, h; overlay_window_size(&ww, &h);
     if (h != last_h || ww != last_w) { last_w = ww; last_h = h; s = 1;   // (the width picks the layout, whose buttons are sized for its form factor)
         float face = 0.1f; const ov_ctl *L = OV_CTLS; for (int i = 0; i < OV_N; i++) if (L[i].kind == OV_BUTTON && L[i].btn == DM_BTN_A) face = L[i].w;   // A's width, in window heights
         if (h > 0 && g_dpi > 0 && g_dpi < 0xfffe) { float mm = face * (float)h / (float)g_dpi * 25.4f; s = OV_MIN_MM / mm; if (s < 1) s = 1; if (s > 1.45f) s = 1.45f; }   // (more and the face buttons touch)

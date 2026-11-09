@@ -1,3 +1,31 @@
+# 2026-11-09 final stock-driver build: retained optimizations, adaptive pacing off.
+# Direct system loader restored; four-frame submission-order review found no
+# same-frame submit-then-wait dependency. NVN async remains off; no 60FPS guarantee.
+# User previously confirmed scene/text/menu/touch correctness; diagnostics off.
+# Overlay window snapshot off/on/off:270/2/270 queries per recording;
+# ~1414draws,54passes,3parts; user confirms graphics/text/controls/touch normal.
+# Normal frame p50 20.34/17.44/20.28ms; mean producer48.19/56.35/48.61FPS.
+# Normal GPU spans also vary; synchronized normal-window clocks not captured.
+# Retained for268 redundant queries removed, not a fixed2.87ms CPU-cost claim.
+# 227checks,145native sources; original shaders/quality/driver and all protections.
+# Same-process512/1024/512, ~1529draws:60/59/60passes;4mainCBs unchanged.
+# Normal frame p50 19.22/18.66/19.15ms; p95 21.26/21.14/21.22ms.
+# Matched512+22draw run ->534draw run: sparse GPU interval reduction~0.94ms;
+# normal frame improvement~0.525ms; p95 benefit small, sustained60FPS not reached.
+# User confirms graphics/text/menu normal.223checks; full per-draw hazards,
+# depth/LRZ protection, full rebinding and independent CB256limit remain.
+# Dynamic-state packet same-process off/on/off, matched 1530.1 draws, 61 passes, 2 dispatches:
+# frame p50 19.72/17.48/18.72 ms; submit+present p50 6.86/6.20/6.87 ms.
+# Full300frame queue records ~5.754M/2.541M/~5.754M: 3213210 state records omitted,
+# while all 3672240 state driver calls remain. User confirms scene/text/menu normal.
+# 223 checks, 145 native sources passed. Not sustained60FPS; p95 benefit remains unproven.
+# Follow-up same-process 256/512/256: 1530-1531 draws, 63/61/63 physical passes;
+# normal frame p50 20.25/19.71/20.45 ms. Window 512 saves ~0.64 ms versus bracketed controls.
+# User confirms normal graphics/text/menu; full dependencies/rebinding and CB limit 256 retained.
+# 60 FPS and stable p95 improvement are not established; 512 remains a bounded window.
+# Recorder wake coalescing: controlled 64 queued records retain FIFO with 64 -> 1 notifications.
+# 220 checks, 145 native sources; PJD110 startup and user gameplay/menu checks passed.
+# Empty-wake rearming and concurrent producers/drain waiters tested; no FPS gain claimed.
 # DRAGON QUEST BUILDERS 2, Hong Kong 1.7.3, KTGL / SDK 5.4.0.
 # PJD110 / Adreno 750, 2026-11-06: stock-driver title and user-entered save confirmed.
 # Docked dialogue, empty-barrier fix off/on/off: 18.42/30.00/18.11 FPS.
@@ -31,6 +59,29 @@
 # has no image-storage interfaces. Unknown/storage bundles keep original usage.
 # User confirmed walking, camera, game menu, pause menu, text and touch direction.
 # Stock driver, full resolution, previous barriers/LRZ protection unchanged.
+# 2026-11-07 producer space credit: full300frame windows retained ~5.52M commands;
+# space-check acquire loads5520203 ->7; checks5520203/5520193; wait yields0/0.
+# Cached reads remain conservative; forced-full/wrap/two-producer tests passed.
+# Optimized ELF cursor slots are128bytes/aligned128; original read cursor shared
+# a64byte address block with the producer lock/write cursor. No alignment-only FPS claim.
+# User confirmed graphics/text/menu normal;212checks and144native sources passed.
+# Retained for redundant operation reduction; normal counter profiling is off.
+# 2026-11-07 same-process direct/queued/direct:1459.10draws,59passes,2dispatches/frame;
+# all3phases had4main render parts. Full600frame workload windows matched.
+# Critical record-through-submit medians:3.65/3.01/3.68ms (includes recorder drain).
+# Middle GPU gaps:3.25/2.08/2.82ms; routine frame p50:24.12/22.40/24.23ms.
+# Direct diagnostic control retains wrapper costs; this is not an exact startup-off comparison.
+# User confirmed graphics/text/menu normal;209checks and144native sources passed.
+# Counted drain waiters fix an offline-reproduced missed-notification race;
+# no claim that the race caused a previously observed device stall.
+# 2026-11-07 within-draw binding coalescing: a pure300frame window removed
+# 1317090 stencil/vertex API calls (4390.3/frame), with complete state reemitted.
+# 207 checks passed; subsequent user confirmed graphics, text and menus normal.
+# Retained for command reduction; no stable FPS gain from sparse timing claimed.
+# 2026-11-07 linear cache:4096x4096 RGBA8 source unchanged in600audit frames.
+# Same-process complete windows:600full uploads ->3(99.5%fewer);1462draws retained.
+# User confirmed static scene/text; partial-row updates are production-tested,
+# but changing source contents have not yet been exercised on this device.
 status	boots
 tested	1.7.3 PJD110 (Adreno 750)
 package	org.nx2a.dqb2
@@ -52,6 +103,16 @@ env	DM_VK_CB_DRAWS=256
 env	DM_VK_SCOPED_BARRIERS=1
 env	DM_VK_DEDUP_ADJ_BARRIER=1
 env	DM_VK_REBIND_FAST=1
-env	DM_VK_TEXTURE_BARRIER_DRAWS=256
+env	DM_VK_TEXTURE_BARRIER_DRAWS=1024
 env	DM_VK_PRESENT_FUSED=1
 env	DM_VK_IMAGE_USAGE_TRIM=1
+env	DM_VK_LINEAR_CACHE=1
+env	DM_VK_BIND_BATCH=1
+env	DM_VK_MT_REPLAY=1
+env	DM_VK_MT_SPACE_CACHE=1
+env	DM_VK_MT_STATE_BATCH=1
+env	DM_OVERLAY_WINDOW_CACHE=1
+env	DM_VK_MT_RECORD=1
+env	DM_GPU_PERF=0
+env	DM_GPU_TURBO=0
+env	DM_NVN_ASYNC=0

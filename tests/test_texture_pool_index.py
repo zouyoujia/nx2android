@@ -37,6 +37,7 @@ enum {EVICT_KEEP=60};
 static pthread_mutex_t g_img_mu=PTHREAD_MUTEX_INITIALIZER;
 static unsigned char freed[20000];
 static unsigned next_id=1,forgotten,view_drops,dirty_releases,defer_regular,defer_sub;
+static void linear_cache_forget(vkimg_t *im){(void)im;}
 static void vk_lrz_forget(vkimg_t *im){assert(!freed[im->img]);forgotten++;}
 static void vk_tex_view_drop_all(vkimg_t *im){assert(!freed[im->img]);view_drops++;}
 static void nvn_dirty_release(const void *p,size_t n){assert(p && n);dirty_releases++;}

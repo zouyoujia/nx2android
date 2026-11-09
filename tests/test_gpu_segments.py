@@ -62,6 +62,25 @@ int main(void){
 }
 ''')
 
+    def test_cpu_section_epochs_bounds_disabled_and_snapshot(self):
+        self.compile_run(r'''
+#include <assert.h>
+#include "gpu_segments.h"
+static vk_gs_state s;
+int main(void){
+ vk_gs_part_begin(&s);vk_gs_cpu_add(&s,VK_GS_CPU_DESC,100,1,1);assert(!s.work[0][VK_GS_CPU_DESC].calls);
+ s.cpu_sections=1;vk_gs_cpu_add(&s,VK_GS_CPU_DESC,100,1,1);vk_gs_cpu_add(&s,VK_GS_CPU_DESC,23,1,1);
+ assert(s.work[0][VK_GS_CPU_DESC].calls==2 && s.work[0][VK_GS_CPU_DESC].ns==123);
+ vk_gs_cpu_add(&s,VK_GS_CPU_OP+25,200,1,1);assert(s.op[0][25].ns==200 && s.op[0][25].calls==1);
+ vk_gs_cpu_add(&s,VK_GS_CPU_DESC,9999,1,2);assert(s.cpu_crossed[0]==1 && s.work[0][VK_GS_CPU_DESC].ns==123);
+ vk_gs_cpu_add(&s,VK_GS_CPU_OP+64,10,2,2);assert(!s.op[0][63].calls && s.work[0][VK_GS_CPU_DESC].calls==2);
+ vk_gs_part_end(&s);vk_gs_cpu_add(&s,VK_GS_CPU_DESC,9999,2,2);assert(s.work[0][VK_GS_CPU_DESC].ns==123);
+ vk_gs_part_begin(&s);vk_gs_cpu_add(&s,VK_GS_CPU_VERTEX,10,2,2);assert(s.work[1][VK_GS_CPU_VERTEX].ns==10 && !s.work[0][VK_GS_CPU_VERTEX].calls);
+ vk_gs_state copy=s;memset(&s,0,sizeof s);assert(copy.work[0][VK_GS_CPU_DESC].ns==123 && copy.op[0][25].ns==200 && copy.work[1][VK_GS_CPU_VERTEX].ns==10);
+ return 0;
+}
+''')
+
     def test_completion_intervals_partition_gaps_and_wraparound(self):
         self.compile_run(r'''
 #include <assert.h>
@@ -129,7 +148,7 @@ int main(void){
     def test_actual_vulkan_hooks_default_off_nesting_slot_snapshot_and_failed_submission(self):
         source=(DM/'android/gfx_vk_core.c').read_text()
         names=('vk_gpu_segments_request','gpu_segment_stamp','vk_gpu_segment_begin',
-               'vk_gpu_segment_end','gpu_segment_cpu','gpu_segment_part_begin','gpu_segment_part_end',
+               'vk_gpu_segment_end','vk_gpu_segment_active','gpu_segment_calibrate','gpu_segment_cpu','gpu_segment_part_begin','gpu_segment_part_end',
                'gpu_segment_sub_begin','gpu_segment_snapshot','gpu_segment_collect','vk_img_barrier_all')
         implementations='\n'.join(function(source,name) for name in names)
         capture=re.search(r'typedef struct \{[^\n]+\} gpu_capture;',source).group()
@@ -157,7 +176,8 @@ int main(void){
 #include <time.h>
 #define NSLOT 6
 #define VKLOG(...) do {if(0)fprintf(stderr,__VA_ARGS__);} while(0)
-static VkQueryPool g_gsq;static vk_gs_state g_gs_slot[NSLOT];static int g_gs_active,g_cur=2;
+static PFN_vkGetCalibratedTimestampsEXT g_calibrate;
+static VkQueryPool g_gsq,g_gsuq;static vk_gs_state g_gs_slot[NSLOT];static int g_gs_active,g_cur=2;static int g_vk_cpu_sections;
 static int g_gs_request=-1;static vk_gs_sampler g_gs_sampler;static uint32_t g_gs_captures;
 static uint64_t g_cur_frame=100;static struct {VkDevice dev;} V;
 static unsigned writes,resets,barriers,reads,query_next;static int final_fence_passed;
@@ -167,7 +187,7 @@ static void vkCmdWriteTimestamp(VkCommandBuffer cb,VkPipelineStageFlagBits stage
     assert(cb==main_cb && stage==VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT && pool==g_gsq && q==(uint32_t)g_cur*VK_GS_QUERIES+query_next++);writes++;
 }
 static void vkCmdResetQueryPool(VkCommandBuffer cb,VkQueryPool pool,uint32_t base,uint32_t count){
-    assert(cb==main_cb && pool==g_gsq && base==(uint32_t)g_cur*VK_GS_QUERIES && count==VK_GS_QUERIES);resets++;query_next=0;
+    assert(cb==main_cb && pool==g_gsq && base==(uint32_t)g_cur*VK_GS_QUERIES && (count==VK_GS_QUERIES || count==2*VK_GS_PARTS || count==2*(VK_GS_PARTS+256)));resets++;query_next=0;
 }
 static void vkCmdPipelineBarrier(VkCommandBuffer cb,VkPipelineStageFlags src,VkPipelineStageFlags dst,VkDependencyFlags dep,uint32_t nm,const VkMemoryBarrier *m,uint32_t nb,const VkBufferMemoryBarrier *b,uint32_t ni,const VkImageMemoryBarrier *i){
     assert(cb && src==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT && dst==VK_PIPELINE_STAGE_ALL_COMMANDS_BIT && !dep && nm==1 && !nb && !b && !ni && !i);
@@ -209,6 +229,123 @@ int main(void){
     vk_gpu_segments_request(8);gpu_segment_sub_begin();g_cur_frame=201;
     for(int i=0;i<64;i++){gpu_segment_sub_begin();assert(g_gs_active);gpu_segment_part_end();free(gpu_segment_snapshot(0));}
     gpu_segment_sub_begin();assert(!g_gs_active && !g_gs_sampler.remaining && !g_gs_sampler.selected);
+    setenv("DM_VK_GPU_PARTS_ONLY","1",1);setenv("DM_VK_CPU_SECTIONS","1",1);
+    vk_gpu_segments_request(1);gpu_segment_sub_begin();g_cur_frame=401;gpu_segment_sub_begin();
+    assert(g_gs_active && g_vk_cpu_sections && g_gs_slot[2].parts_only && g_gs_slot[2].cpu_sections);
+    unsigned old=writes;assert(!vk_gpu_segment_begin(VK_GS_PASS,0,1920,1080));assert(writes==old);
+    vk_img_barrier_all(main_cb);assert(writes==old);gpu_segment_part_end();assert(writes==old+1);
+    c=gpu_segment_snapshot(0);assert(c && c->state.nq==2 && !c->state.nr && !g_vk_cpu_sections);free(c);
+    unsetenv("DM_VK_GPU_PARTS_ONLY");unsetenv("DM_VK_CPU_SECTIONS");
+    setenv("DM_VK_GPU_PASSES_ONLY","1",1);vk_gpu_segments_request(1);gpu_segment_sub_begin();g_cur_frame=601;gpu_segment_sub_begin();
+    assert(g_gs_active && g_gs_slot[2].passes_only && !g_gs_slot[2].parts_only && !vk_gpu_segment_active() && !g_vk_cpu_sections);
+    old=writes;vk_img_barrier_all(main_cb);assert(writes==old);
+    assert(!vk_gpu_segment_begin(VK_GS_LRZ_READ,0,1,1));assert(!vk_gpu_segment_begin(VK_GS_LRZ_WRITE,0,1,1));
+    token=vk_gpu_segment_begin(VK_GS_PASS,0,1920,1080);assert(token);vk_gpu_segment_end(token,1460);
+    token=vk_gpu_segment_begin(VK_GS_COMPUTE,0,1,1);assert(token);vk_gpu_segment_end(token,1);gpu_segment_part_end();
+    c=gpu_segment_snapshot(0);assert(c && c->state.nq==6 && c->state.nr==2 && !c->state.detail.n);free(c);
+    unsetenv("DM_VK_GPU_PASSES_ONLY");
     return 0;
+}
+''')
+
+
+    def test_upload_hooks_query_ownership_partial_coverage_and_queue_order(self):
+        source=(DM/'android/gfx_vk_core.c').read_text()
+        names=('gpu_segment_upload','gpu_segment_queue','vk_gpu_upload_note',
+               'vk_gpu_segment_active','vk_gpu_segment_draw','gpu_segment_collect')
+        implementations='\n'.join(function(source,name) for name in names)
+        capture=re.search(r'typedef struct \{[^\n]+\} gpu_capture;',source).group()
+        self.compile_run(r'''
+#define VK_NO_PROTOTYPES
+#include <vulkan/vulkan_core.h>
+#include <assert.h>
+#include <stdlib.h>
+#include "gpu_segments.h"
+#define NSLOT 6
+static VkQueryPool g_gsq=(VkQueryPool)1,g_gsuq=(VkQueryPool)2;
+static vk_gs_state g_gs_slot[NSLOT];static int g_gs_active,g_cur=2;
+static uint64_t g_queue_serial=21,g_present_serial=18,g_present_ticket=77;
+static struct {VkDevice dev;} V;
+static unsigned resets,writes,reads;static int retired;
+static VkCommandBuffer upload=(VkCommandBuffer)9;
+static void vkCmdResetQueryPool(VkCommandBuffer cb,VkQueryPool pool,uint32_t first,uint32_t count){
+ assert(cb==upload && pool==g_gsuq && first==2*VK_GS_PARTS*3 && count==3 && !writes);resets++;
+}
+static void vkCmdWriteTimestamp(VkCommandBuffer cb,VkPipelineStageFlagBits stage,VkQueryPool pool,uint32_t q){
+ assert(cb==upload && pool==g_gsuq && resets==1 && q==2*VK_GS_PARTS*3+writes);
+ assert(stage==(writes?VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT:VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT));writes++;
+}
+static VkResult vkGetQueryPoolResults(VkDevice dev,VkQueryPool pool,uint32_t first,uint32_t count,size_t bytes,void *data,VkDeviceSize stride,VkQueryResultFlags flags){
+ assert(retired && dev==V.dev && stride==sizeof(vk_gs_query));
+ assert(flags==(VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WITH_AVAILABILITY_BIT));
+ assert((pool==g_gsq && count==2 && first==2*VK_GS_QUERIES) || (pool==g_gsuq && count==3 && first==2*VK_GS_PARTS*3));
+ assert(bytes==count*sizeof(vk_gs_query));
+ vk_gs_query *q=data;for(unsigned i=0;i<count;i++)q[i]=(vk_gs_query){100+i*20,1};reads++;return VK_SUCCESS;
+}
+'''+capture+implementations+r'''
+int main(void){
+ gpu_segment_upload(upload,0);gpu_segment_queue(1);vk_gpu_upload_note(2,4096);
+ assert(!resets && !writes && !vk_gpu_segment_active());
+ g_gs_active=1;vk_gs_state *s=&g_gs_slot[2];assert(vk_gs_part_begin(s)==0);
+ gpu_segment_upload(upload,0);gpu_segment_upload(upload,1);gpu_segment_upload(upload,2);
+ assert(resets==1 && writes==3 && s->upload_flags[0]==7);
+ gpu_segment_queue(1);assert(s->queue[0][0]==21 && s->queue[0][1]==18 && s->queue[0][2]==77 && s->queue[0][3]==1);
+ vk_gpu_upload_note(2,4096);vk_gpu_upload_note(2,2048);assert(s->upload_causes[0][2][0]==2 && s->upload_causes[0][2][1]==6144);
+ vk_gs_part_end(s);vk_gs_part_begin(s);g_queue_serial=22;gpu_segment_queue(0);
+ assert(s->queue[1][0]==22 && s->queue[1][1]==18 && !s->queue[1][3]);
+ gpu_segment_upload(upload,1);gpu_segment_upload(upload,2);assert(s->upload_flags[1]==8 && writes==3);
+ // Upload already begun before sampling: no made-up start, reset or stale-query read.
+ gpu_capture *c=calloc(1,sizeof *c);c->state=*s;c->state.nq=2;g_gs_active=0;retired=1;
+ gpu_segment_collect(c,2);assert(reads==2 && c->upload[0][2].available && !c->upload[1][0].available);
+ vk_gd_state *d=&c->state.detail;vk_gd_draw v={.vs=1,.fs=2,.pass=4,.count=1};
+ for(int i=0;i<100;i++)vk_gd_add(d,&v);assert(d->n==1 && d->draw[0].count==100);
+ v.texture[0]=8;vk_gd_add(d,&v);assert(d->n==2); // shader same, resource dependency differs
+ v.pass=5;vk_gd_add(d,&v);assert(d->n==3); // do not merge across passes
+ for(unsigned i=3;i<VK_GD_RECORDS;i++){v.pass=i+10;vk_gd_add(d,&v);}
+ v.pass=5000;vk_gd_add(d,&v);assert(d->n==VK_GD_RECORDS && d->dropped==1);
+ free(c);return 0;
+}
+''')
+
+    def test_actual_clock_calibration_requires_sparse_sample_and_valid_result(self):
+        src=(DM/'android/gfx_vk_core.c').read_text()
+        self.compile_run(r'''
+#define VK_NO_PROTOTYPES
+#include <vulkan/vulkan_core.h>
+#include <assert.h>
+#include "gpu_segments.h"
+static vk_gs_state g_gs_slot[6];static int g_gs_active,g_cur=2;
+static struct{VkDevice dev;}V;static unsigned calls;static VkResult result;static uint64_t err=500;
+static PFN_vkGetCalibratedTimestampsEXT g_calibrate;
+static VkResult fake(VkDevice dev,uint32_t n,const VkCalibratedTimestampInfoEXT *i,uint64_t *v,uint64_t *e){
+ assert(dev==V.dev && n==2 && i[0].sType==VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT && !i[0].pNext);
+ assert(i[0].timeDomain==VK_TIME_DOMAIN_DEVICE_EXT && i[1].timeDomain==VK_TIME_DOMAIN_CLOCK_MONOTONIC_EXT);
+ calls++;v[0]=100;v[1]=123000;*e=err;return result;
+}
+'''+function(src,'gpu_segment_calibrate')+r'''
+int main(void){
+ gpu_segment_calibrate(0);assert(!calls);g_calibrate=fake;
+ gpu_segment_calibrate(0);assert(!calls);g_gs_active=1;
+ gpu_segment_calibrate(VK_GS_PARTS);assert(!calls);
+ result=VK_ERROR_DEVICE_LOST;gpu_segment_calibrate(0);assert(calls==1 && !g_gs_slot[2].calibration[0][1]);
+ result=VK_SUCCESS;err=0;gpu_segment_calibrate(0);assert(calls==2 && !g_gs_slot[2].calibration[0][1]);
+ err=500;gpu_segment_calibrate(1);assert(calls==3 && g_gs_slot[2].calibration[1][0]==100 && g_gs_slot[2].calibration[1][1]==123000 && g_gs_slot[2].calibration[1][2]==500);
+ assert(!g_gs_slot[2].calibration[0][0]);g_cur=-1;gpu_segment_calibrate(1);assert(calls==3);
+ return 0;
+}
+''')
+
+    def test_pass_only_query_budget_keeps_part_boundaries_when_records_overflow(self):
+        self.compile_run(r'''
+#include <assert.h>
+#include "gpu_segments.h"
+static vk_gs_state s;
+int main(void){
+ s.passes_only=1;assert(vk_gs_query_cap(&s)==576);assert(vk_gs_part_begin(&s)==0);
+ for(unsigned i=0;i<256;i++){uint32_t t=vk_gs_begin(&s,VK_GS_PASS,0,1,1);assert(t);assert(vk_gs_end(&s,t,1)!=VK_GS_NONE);}
+ assert(!vk_gs_begin(&s,VK_GS_PASS,0,1,1)&&s.dropped==1);assert(vk_gs_part_end(&s)!=VK_GS_NONE);
+ for(unsigned i=1;i<VK_GS_PARTS;i++){assert(vk_gs_part_begin(&s)!=VK_GS_NONE);assert(vk_gs_part_end(&s)!=VK_GS_NONE);}
+ assert(s.nq==576 && s.nr==256 && s.np==VK_GS_PARTS && !s.invalid);
+ s.parts_only=1;assert(vk_gs_query_cap(&s)==64);s.parts_only=s.passes_only=0;assert(vk_gs_query_cap(&s)==VK_GS_QUERIES);return 0;
 }
 ''')

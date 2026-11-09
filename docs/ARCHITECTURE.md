@@ -159,7 +159,18 @@ to 32 main command-buffer parts. Bottom-of-pipe markers bracket render passes
 (including begin/end load/store work), LRZ reads/writebacks, standalone global
 barriers and compute work including its barriers. Nested barriers belong to the
 outer LRZ/compute interval. Upload-command-buffer barriers are counted separately
-and are not attributed to main-buffer intervals. These are completion intervals,
+and are not attributed to main-buffer intervals. Selected frames additionally
+bracket each upload CB (TOP start, BOTTOM before/after its existing final barrier)
+in a separate query pool reset by that upload CB. Already-recorded uploads are
+marked incomplete rather than read as complete samples. Upload causes/bytes,
+main-submit queue serials and the last presentation-submit serial/ticket identify
+unobserved upload work and presentation interleaving. Main submits retain their
+original wait/signal arrays. At most 1,024 adjacent shader/resource groups per
+submission identify the timed pass record, VS/FS, attachment and sampled guest
+addresses; unknown bindings, truncation and dropped draws remain explicit.
+Metadata logging happens on the completion worker after retirement, not inside
+recording. Address equality alone does not establish subresource overlap.
+These are completion intervals,
 not utilization or isolated ALU costs; timestamps themselves can disturb binning.
 Part begin/end markers expose elapsed gaps between early-submitted parts without
 assuming those gaps are CPU stalls. Unclassified time remains explicit.
@@ -217,7 +228,7 @@ the NVN bound; indirect and unresolved resources fall back. Deferred handle read
 copies, uniform updates, clears, counters, transform feedback, dispatches and
 unknown records flush before execution. Natural pass ends and the draw cap
 also discharge pending synchronization. `DM_VK_TEXTURE_BARRIER_DRAWS` changes
-that policy window per submission (128 by default, bounded to 128..512; invalid
+that policy window per submission (128 by default, bounded to 128..1024; invalid
 values fall back to 128). A live window change first discharges any pending
 dependency and resets its diagnostic interval. Larger windows retain every
 resource/writer/generation check, full state rebinding, and the independent
@@ -719,3 +730,462 @@ shared-core defaults stay off. The installed diagnostic APK remains usable;
 its next-launch environment enables the two paths and disables image audit.
 The current process retains startup audit until restart, but no timed GPU
 sampling or device-control loop remains active.
+
+PJD110 sparse follow-up (2026-11-07): three valid captures attributed the final
+2.447-2.833 ms main-part gap to its preceding linear-texture upload CB
+(2.421-2.806 ms including the initial full barrier/copy); its final barrier was
+under 0.001 ms. Consecutive queue serials and an unchanged presentation serial
+exclude app-side presentation interleaving there. One linear copy per sampled
+frame covered a 64 MiB source stride extent; this is not a measured pixel-copy
+size or physical bandwidth. The CPU-source linear path deduplicates only within
+an upload CB, not by cross-frame content changes. Dirty-page reuse/row uploads
+remain candidates until actual source changes, GPU writes and alias safety are
+accounted for. The two-draw heavy pass uses fragment keys cec1332f55ff0e3a and
+2c2d8f2adabda75b over the earlier G-buffer/depth/shadow inputs. Its combined
+2.478-2.870 ms is not a per-shader timing. The camera and draw count differ from
+the prior run, so neither frame-rate changes nor regressions are attributed to
+the source merge or diagnostics from these captures.
+
+`DM_VK_LINEAR_CACHE` is a default-off large-linear-texture experiment: 0 keeps
+original uploads, 2 audits while still copying in full, and 1 reuses unchanged
+images or copies complete rows covering changed CPU pages. The live switch
+invalidates history across mode transitions. Only tracked spans of at least
+1 MiB, single-level/layer, ordinary physical pools with no image aliases qualify.
+CPU watch spans are split at 1 MiB boundaries: the existing fault handler
+releases a complete protect-call span, so one atlas write need not dirty its
+entire storage; page-by-page mappings are still avoided. A 1,024-event GPU buffer-write journal includes transfer/fill/deferred writes and
+conservative storage descriptor ranges before memo hits; opaque writers and
+transform feedback invalidate all ranges. Evicted pending events remain globally
+pending until their fence completes. History loss, pending/deferred writes,
+unknown tracking and region overflow retain full uploads. The existing rule for
+GPU-written linear images is independent and preserved. CPU protection is armed
+before copying, with a generation captured before the dirty-page scan; later
+writes cannot be silently absorbed into that snapshot. The shared dirty-run API
+is observation-only and returns unknown on truncation. Row offsets obey Vulkan
+alignment; up to 128 merged row regions retain the original surrounding barriers.
+No clean hit begins an otherwise unused upload CB. Logs distinguish source stride
+extent, actual pixel bytes and candidate reductions; audit mode is not an actual
+bandwidth-saving claim. New raw guest GPU-buffer writers must notify the journal,
+and new/unknown shader interfaces must stay conservative.
+
+PJD110 same-process linear audit/enable (2026-11-07): the source was actually
+4096x4096 RGBA8, stride 16384, 64 MiB of pixels. Two complete audit windows each
+had 300 unchanged candidates but 300 full copies. Complete enabled windows had
+1 and 2 full copies per 300 frames (99.5% fewer across 600 frames), with 1462
+draws/frame retained; sparse enabled captures had no upload CB/barriers. No new
+RED lines or visible static menu/text problems were observed. Dynamic-content
+row uploads have production-function tests but have not yet been exercised by a
+changing source on this device. Initial enabled code kept the last-copy GPU
+history cursor, which can conservatively force periodic refreshes on unrelated event-ring
+turnover. The observed fallback reports have not individually classified
+that reason yet. Clean hits now advance the checked GPU cursor while retaining the
+original CPU dirty stamp; that follow-up is tested and installed.
+
+`DM_VK_GPU_CALIBRATE=1` is a default-off diagnostic for the remaining main-part
+feeding gaps. Device creation enables KHR/EXT calibrated timestamps only when
+the driver advertises it, exports the physical-device query and supports both
+DEVICE and CLOCK_MONOTONIC domains. A sparse GPU sample takes one calibration
+before each submit and records device ticks, monotonic ns and maxDeviation with
+that part. Failed/zero-deviation/missing results remain explicitly unavailable.
+There is no queue wait or rendering/synchronization change. Tick wrapping uses
+the queue valid bits; offline mapping must propagate the reported error bound
+and reject excessive deviation or disagreeing nearby calibrations. Raw CPU/GPU
+epochs must still never be subtracted without this calibration. Semantics:
+https://docs.vulkan.org/refpages/latest/refpages/source/vkGetCalibratedTimestampsKHR.html
+
+A calibrated three-frame capture on the stock Adreno 750 established that the
+remaining middle part finished CPU recording 1.02/1.85/1.86 ms after the previous
+GPU part ended (conservative lower bounds 0.92/1.75/1.76 ms). The final part
+was already ready, with only 0.019-0.022 ms between GPU parts. Reducing the
+ordinary draw threshold to 128 did not alter the protected four-part structure;
+256 was restored. This establishes late CPU preparation in those samples, not
+a complete explanation of all GPU scheduling or utilization.
+
+`DM_VK_BIND_BATCH=1` is a default-off CPU command-recording experiment. Within
+one draw, equal front/back stencil values use FRONT_AND_BACK instead of two
+calls; differing values keep both calls. Adjacent vertex slots are sent in one
+vkCmdBindVertexBuffers call, with holes left untouched. Every original binding
+is represented and guarded mode still re-emits complete state every draw;
+there is no cross-draw cache or barrier/pass change. `DM_VK_BIND_BATCH_PROF=1`
+counts original-equivalent versus emitted calls every 300 presents; turn it off
+for normal play. Vulkan semantics:
+https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdSetStencilReference.html
+https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdBindVertexBuffers.html
+
+Sparse recording attribution can set `DM_VK_GPU_PARTS_ONLY=1` and
+`DM_VK_CPU_SECTIONS=1` before a bounded `DM_VK_GPU_SAMPLES` request. Parts-only
+mode keeps main-CB boundary/upload timestamps and calibration, skips internal
+pass/LRZ/barrier/compute queries and all draw-resource metadata, and resets at
+most 64 main queries instead of the full segment capacity. It preserves real
+barriers, passes, bindings and cuts. CPU section clocks run only in selected
+submissions; normal replay takes no additional clocks or atomic counters.
+Sections classify descriptor/pipeline preparation and pipeline/dynamic/descriptor/
+vertex binding. Opcode times include nested draw sections: do not add those
+totals together. An opcode or section crossing a main-CB epoch is counted as
+crossed and omitted from attribution; unclassified time remains explicit.
+Reports are buffered in the submission snapshot and emitted after completion,
+without adding queue waits. Keep these switches off for normal play.
+
+PJD110 retained within-draw batching on 2026-11-07: a pure 300-frame interval
+reduced stencil calls from 2,624,580 to 1,312,290 and vertex-binding calls from
+480,930 to 476,130 (1,317,090 fewer calls total). Mixed intervals around delayed
+DM_CTL processing were excluded. DQB2 enables it in the profile after the user
+confirmed scene/text/menu correctness in the subsequent lightweight run. It
+removes commands; a stable frame-rate gain has not been established.
+
+The lightweight four-part run emitted 8 main timestamps instead of 486, with
+no internal pass queries or draw-resource metadata. With CPU section clocks off,
+three middle gaps were 2.106/2.547/2.619 ms, CPU recording 2.806/3.091/3.141 ms,
+and calibrated late-ready lower bounds 1.422/1.869/1.882 ms. Late CPU preparation
+therefore persists without detailed GPU sampling. Section clocks add measurable
+work: use their separate enabled/disabled controls. The heavy part's descriptor
+preparation/binding each measured roughly 0.5-0.7 ms, dynamic state about 0.05 ms;
+those are diagnostic section durations, not guaranteed recoverable savings.
+Two-stage replay remains off by default in the shared core. DQB2 now enables
+it after the same-process trial below. Attribution must include recorder drain,
+end-command-buffer time and actual submit lead, not just producer recording.
+
+With startup `DM_VK_MT_REPLAY=1`, `DM_VK_MT_RECORD=0/1` is a diagnostic live
+bypass refreshed at submission boundaries (default 1). Mode 0 stops enqueueing
+under the producer lock, drains the old FIFO and sends subsequent commands
+through the original direct fallback; mode 1 resumes enqueueing after a drain.
+Wrappers/recorder remain installed, so the bypass control has some wrapper
+cost versus a true startup-disabled build. Each direct fallback also drains;
+per-producer command order, argument copies, command-pool synchronization and
+queue ownership stay unchanged. Normal startup-disabled replay does not read
+the extra environment key or alter entry points. Sparse part-only timing and
+routine workload counts can now compare paths in one process and view.
+
+Recorder drain notifications count concurrent waiters. A boolean allowed the
+first waiter to clear notification state while a later waiter still needed a
+broadcast for its larger queue position. This source-level race is separately
+regression tested; it has not been established as the cause of a device stall.
+
+PJD110 same-process direct/queued/direct controls on 2026-11-07 matched complete
+600-frame windows (1459.10 draws, 59 passes, 14 folded clears, 2 dispatches/frame;
+4 main render parts in all sparse samples). Median critical recording through
+submit, including end-CB drain, was 3.65/3.01/3.68 ms. The corresponding GPU
+boundary gaps were 3.25/2.08/2.82 ms; normal frame p50 summaries were
+24.12/22.40/24.23 ms. Queued end-CB cost rose to 0.267 ms from direct
+0.099/0.109 ms, but did not erase the earlier preparation. Relative to the
+bracketed direct control, measured record-through-submit and GPU gap reductions
+were 0.652 and 0.958 ms. Counts and calibrated/error-bounded submit lead support
+latency relief; direct control wrapper overhead, residual DVFS drift and sparse
+observation costs limit the effect estimate. This is not proof of peak CPU/GPU
+utilization or a universal FPS gain. The user confirmed scene/text/menu correctness;
+DQB2 retains startup MT_REPLAY=1 with live MT_RECORD defaulting to 1. All diagnostic
+sampling is disabled in the installed normal configuration. No screenshots were
+used in this trial.
+
+`DM_VK_MT_SPACE_CACHE=1` is a default-off, live producer ring-space cache.
+Under the existing producer lock, a cached consumer position grants only space
+already observed with acquire ordering. Stale credit is conservative: refresh
+only when it cannot cover a record or wrap marker, then keep the original
+acquire/wake/yield backpressure. Cache state is shared under the producer lock;
+mode changes never turn old credit into extra space. FIFO publication, recorder
+progress stores, wakeups, drain targets and argument copies are unchanged.
+Published/read cursors occupy complete separate 128-byte-aligned slots with
+hidden linkage; the checked optimized ELF retains both complete 128-byte slots. The previous PJD110
+binary placed the read cursor in the same 64-byte address block as the producer
+lock/write cursor. Correctness does not depend on cache-line size; a device
+speed benefit from alignment alone has not been measured.
+`DM_VK_MT_SPACE_PROF=1` counts queued records, space checks, producer acquire loads
+and wait yields under that lock, with no diagnostic atomic per command. Reports
+arrive every 300 presents and identify mode/profile epochs; partial epoch
+intervals remain explicit. These counts exclude consumer/drain acquire loads.
+Normal profiling remains off. A production-FIFO test preserves 64 records while
+producer space-check acquire loads drop from 64 to 0 with available cached credit;
+separate tests force backpressure/wrap and concurrent producers.
+
+PJD110 operation census on 2026-11-07 used two full 300-frame windows. Legacy
+and cached paths queued 5,520,199 and 5,520,188 records, with 5,520,203 and
+5,520,193 space checks. Producer acquire loads fell from 5,520,203 to 7; both
+windows had zero ring-space wait yields. This is a 99.999873% reduction in
+acquires per space check, not a claim about total atomic operations or FPS.
+The optimized ELF confirmed full 128-byte cursor slots. User confirmation of
+scene/text/menu correctness completes retention; DQB2 enables MT_SPACE_CACHE=1
+while normal SPACE_PROF/GPU sampling remain off. Shared-core default stays off.
+
+
+`DM_VK_MT_STATE_BATCH=1` is a default-off, live two-stage recording experiment.
+A fresh draw copies its viewport, scissor, blend constants, both faces of each
+stencil state and depth bias into one FIFO record. The recorder emits every
+original driver call in order, including line width and the existing optional
+within-draw stencil pairing. It does not elide state across draws or weaken the
+complete rebind required by guarded Adreno passes. Disabled recording, allocation
+failure and non-fresh state retain the existing wrappers/cache path. The copied
+record has no caller-owned pointers; existing publication, wrap, drain and
+producer serialization rules apply. SPACE_PROF additionally reports state_packets
+and state_driver_calls; normal profiling stays off.
+
+An 8-second PJD110 system trace found queue lock/unlock chains in 69/573 main
+thread CPU samples, with 51/573 attributable to dynamic-state/stencil recording;
+34/573 samples were drain waits and 95/272 recorder samples were empty-queue
+yields. These sampled CPU shares are not whole-frame time savings. The packet
+removes 7--10 queue records per fresh draw while preserving its 8--11 driver
+calls. CPU samples also place the main thread
+on CPU7 throughout its covered running time, at a weighted 1.472 GHz and a
+weighted reported maximum of 1.608 GHz. GPU clock residency is 500 MHz for
+6.851/7.708 covered seconds; app UID GPU active intervals cover 82.2% of reported
+work periods. These observations do not identify who sets the limits or establish
+that changing a frequency ceiling alone will reach 60 FPS.
+
+The following same-process original/packet/original PJD110 comparison retained
+1530.1 draws, 61 passes and 2 dispatches per frame. Full 300-frame record counts
+were 5,754,348 / 2,541,150 / 5,754,360. The packet phase emitted 459,030 packets
+containing 3,672,240 original state driver calls, removing exactly 3,213,210 queue
+records (55.84% of the equivalent original workload). Space-wait yields stayed
+zero. Normal frame p50 was 19.72 / 17.48 / 18.72 ms and submit+present p50 was
+6.86 / 6.20 / 6.87 ms. Control frame-time drift was 1.00 ms; this single bracketed
+trial does not establish a fixed 1.74 ms benefit. Packet p95 was 20.91 ms versus
+22.52 / 20.69 ms, so stable tail-latency improvement is not established. The
+17.48 ms median equates to 57.2 FPS, not sustained 60 FPS. User-confirmed normal
+scene/text/menu output completes retention. DQB2 enables STATE_BATCH=1, shared
+core default remains off, and all device sampling/counters are disabled.
+
+
+A subsequent bounded 50 us CPU-hint handoff experiment was rejected and its
+implementation archived outside the source tree. Same-process legacy/50us/legacy
+normal p50 was 18.21 / 19.63 / 19.27 ms, submit+present 6.20 / 7.10 / 6.35 ms.
+Three separate 8-second traces showed recorder on-CPU time 3.072 / 2.337 / 2.849 s
+and main on-CPU time 6.267 / 5.558 / 6.042 s. Empty-yield samples disappeared,
+but sleeping intervals grew; sampled syscall savings did not improve the frame's
+critical path. Different frame counts and variable clocks prevent interpreting
+these fixed-duration CPU totals as exact per-frame savings. Earlier state-packet
+optimizations remain enabled. Workqueue execute events were not captured, leaving
+the original CPU limit-policy requester unresolved.
+
+
+`DM_VK_PIPE_EXEC_KEYS=<up to four comma-separated 16-digit fragment keys>` is a
+startup-only, default-off compiler inspection. `DM_VK_PIPE_EXEC_OUT` names an
+absolute diagnostic directory. The executable-properties extension and feature
+are enabled only for a valid request on a supporting device; missing features or
+entry points disable capture. At most two distinct pipeline states per key are
+cloned, with a private empty pipeline cache and statistics/IR capture flags. The
+rendering pipeline and its modules remain unchanged; clones are queried and
+destroyed without GPU submissions, queue waits, or screenshots. Compilation can
+stall loading, so captures are not frame-time measurements. Driver statistics
+and representations are implementation-dependent and capture flags can affect
+compilation; they are evidence about diagnostic clones, not guaranteed exact
+binaries of normal rendering pipelines.
+
+Optional `DM_VK_PIPE_EXEC_BASE_DIR` and `DM_VK_PIPE_EXEC_OPT_DIR` contain
+`<fragment-key>.spv` files for a paired private optimized clone. The supplied
+reference must match the runtime module word-for-word except DescriptorSet
+operands, and the actual fragment stage must use its base module. Otherwise the
+optimized clone is skipped. Runtime SPIR-V is saved for preparation; shader
+compatibility rewrites must precede optimization. Inputs and state counts are
+bounded, statistics are limited to 32 executables and 128 entries each, and IR
+storage is limited to 2 MiB per item / 4 MiB total per run. Failed or incomplete
+IR data queries produce no binary dump; changed data sizes are checked against
+allocated capacity. The large query arrays live on the heap, preserving small replay-thread stacks.
+`DM_VK_PIPE_EXEC_STOP=1` stops future captures live; removing the startup keys
+disables the extension on the next launch. Normal profiles do not enable this diagnostic.
+
+The stock Adreno 750 diagnostic initially returned a properties count equal to
+the supplied capacity (32) after populating only the vertex and fragment entries.
+Querying an unfilled executable crashed inside its statistics function. Capture
+now first queries counts with NULL arrays and rejects unfilled/invalid graphics
+stage entries before any indexed statistics or IR query. Query boundaries are
+flushed to the diagnostic file. This diagnostic-path failure does not establish
+a cause of ordinary rendering frame-time limits.
+
+
+Two-stage recorder notifications now coalesce while one wake is outstanding.
+Under the existing wait mutex, `wake` rechecks and clears the sleep flag before
+signalling. Later producers skip repeated notifications until the reader rearms.
+The reader rearms before every condition wait, including after empty or spurious
+notifications; arming and publication retain sequentially consistent ordering.
+Commands, argument copies, FIFO positions, backpressure and drain targets stay
+unchanged. A controlled production-FIFO test queues 64 commands while the reader
+cannot run, reducing 64 notifications to 1, then exercises 16 empty wakes and
+checks that the next command and drain complete. Existing wrap/backpressure,
+concurrent producer and concurrent drain tests still apply. This removes
+redundant notifications in that controlled case; device frequency and frame-time
+benefit remain unmeasured. The version is installed on PJD110: 220 tests and
+145 native sources pass, 247 prewarm pipelines complete, and no startup crash or
+drain timeout was observed. The user confirmed normal gameplay, graphics, text and menus; the notification
+coalescing change is retained for redundant-work reduction, without an FPS claim.
+
+
+`DM_VK_GPU_PASSES_ONLY=1` narrows bounded sparse sampling to render-pass and
+compute-dispatch intervals plus main-CB boundaries. It omits internal LRZ/barrier
+timestamps and per-draw resource registry walks; CPU section clocks remain an
+independent default-off switch. PARTS_ONLY takes precedence. At most 256 internal
+intervals are retained, leaving room for all 32 part boundary pairs in a
+576-query reset range; overflow is counted, never treated as a complete capture.
+The same sample budget, completion snapshot and error/availability checks apply.
+This mode helps rank whole-frame rendering cost without the much larger detailed
+capture; timestamps still perturb selected frames and measure elapsed intervals,
+not shader-core occupancy or guaranteed optimization savings. Capture mode is
+reported with every snapshot. All normal-play sampling remains off.
+
+
+PJD110 follow-up with the retained build (2026-11-07) targets 60 FPS, rather than
+using command/resource counts as a frame-rate claim. Three unmodified-boundary
+captures measured about 16.1-16.2 ms inside main command buffers and about
+1.5-2.2 ms between them. The normal frame window was 20.36 ms p50 / 22.56 ms p95.
+Pass-only sampling added about 0.43 ms of measured in-part time versus bracketed
+boundary controls, so its detailed intervals rank stages, not uninstrumented
+frame cost. Direct GPU frequency reads were denied (EACCES); CPU policy7 readings
+alone do not identify the limiting policy or prove full GPU performance.
+
+The guard still reported three cap-triggered closes per frame at window 256.
+A same-process 256/512/256 trial preserved 1530-1531 draws and reduced physical
+passes 63/61/63. Normal 300-frame p50 windows were 20.25/19.71/20.45 ms: about
+0.64 ms below the bracketed control, with 0.20 ms control drift. Geometry-pass
+intervals fell about 0.57 ms; total profiled GPU intervals did not show the same
+net reduction and had control drift. p95 was 25.66/22.03/22.09 ms, so stable
+p95 improvement is not established. The user confirmed normal scene/text/menu
+operation. DQB2 retains window 512 with ordinary CB threshold 256 and all
+per-draw alias/read/write/epoch/depth/full-rebinding protections. All sampling
+is off. This remains short of the 16.67 ms frame budget for 60 FPS.
+
+
+A follow-up current 512-window census still reported exactly one cap-forced
+closure per frame in two intervals (1200/1200 and 600/600). The diagnostic upper
+bound now accepts 1024, with shared default 128 and initial DQB2 retained default 512. Read/write/alias/epoch checks, unsupported-state
+fallbacks, full rebinding and independent CB/depth safeguards remain per draw.
+The production guard test preserves 1024 draws with physical ends 8/4/2/1 for
+128/256/512/1024; alias, writer and epoch changes at draw 900 still flush.
+
+
+Same-process PJD110 512/1024/512 validation retained ~1529 draws and four main
+CBs, with physical passes 60/59/60. The contiguous 534-draw run changed from
+512+22 passes to one534-draw pass. Median sparse GPU intervals for that matched
+run fell by0.940ms against bracketed controls; total in-part intervals fell
+by0.841ms. These sparse timestamped frames add query overhead and are separate
+from the normal300-frame windows: normal p50 was19.22/18.66/19.15ms (0.525ms
+benefit,0.070ms control drift), p95 was21.26/21.14/21.22ms. This supports removal
+of the redundant pass and a modest frame benefit, not stable60FPS or major
+stutter improvement. User-confirmed normal scene/text/menu output completes
+retention; DQB2 now enables window1024. Shared default128, CB256 and all hazard,
+epoch, depth/LRZ and full-rebind rules remain unchanged. All device sampling is
+off. Increasing the cap further has no present evidence of additional benefit.
+
+
+Overlay window metrics use a balanced, thread-local draw scope around the
+presentation command recording. `dm_overlay_metrics_begin/end` snapshots only
+width/height, not an ANativeWindow pointer, input state, custom button positions
+or settings. The next frame queries the current window; input/JNI calls outside
+the scope still query live dimensions. Layout/scale result caches are thread-local
+so an input resize cannot overwrite an in-progress render's snapshot.
+`DM_OVERLAY_WINDOW_CACHE=0` is the live legacy-query comparison; default is on.
+The scope begins after successful image acquire and closes before command-buffer
+end/submission, with no early return between. Headless front-end hooks are no-ops.
+Production-function tests compare tablet/phone, small/large and custom-control
+geometry byte-for-byte while repeated getter query counts fall from hundreds to
+two per draw; nested scopes, null windows, live disable, per-frame resize and
+input/render thread isolation are covered. The snapshot is lazy: a scope that
+requests no overlay geometry performs no window queries. Device retention passed:
+user confirmed normal scene, text, control positions and touch/menu behavior.
+
+A preceding12-second gfx/FrameTimeline capture retained9.58seconds after its
+32MiB ring overwrote7.97MiB, including some initial process metadata. Do not use
+12seconds as that capture's event-rate denominator or read missing thread/PID
+associations as missing execution. Retained473SurfaceFlinger frames were on time
+and used hardware composition; the native app had no application FrameTimeline
+slices, so no per-app CPU/GPU deadline classification is established. The present
+thread recorded270outer window-query slices per overlay recording between image
+acquire and submit. Nested slices must not be double-counted. Their instrumented
+p50wall sum1.328ms is not an untraced FPS-saving estimate. Queries between present
+submission and QueuePresent were absent; display-timing polling was only~0.026ms
+in that measured gap, so it is not the high-query path identified here.
+
+
+PJD110 same-process off/on/off validation (227 tests, 145 native sources) kept
+1414/1414/1415 draws, 54 physical passes and 3 render parts. Four-second gfx
+captures retained process metadata separately and reported no trace-data loss or
+buffer overwrite. Every complete overlay recording used exactly270/2/270 outer
+window-query calls. This removes268 redundant calls (99.26%) without changing
+render work, resolution, shaders or device performance requests. The cache remains
+on; all sampling is off.
+
+Separate untraced 300-frame windows measured frame p50 20.34/17.44/20.28ms, p95
+24.70/20.77/22.90ms; checkpoint-based mean producer rates48.19/56.35/48.61FPS.
+Displayed-frame drops were71/21/68 per300, with p99 present intervals
+49.71/33.15/49.71ms. These are short-run observations, not sustained60FPS. The
+normal GPU-span medians also changed17.07/14.52/17.12ms: do not label the full
+2.87ms frame difference as raw CPU query cost. Normal-window frequencies were
+not synchronized with these reports. The separate traced windows contain changing
+CPU/GPU clocks (one baseline had a578MHz GPU event; cache trace ramped310 through
+500MHz; final baseline had no GPU-frequency event). Absent change events do not
+establish a clock value. Retention rests on actual query removal and user
+correctness checks; DVFS versus submission-overlap contribution remains open.
+
+
+A subsequent same-process, cache-on resume capture synchronized kernel GPU
+frequency events with normal300frame windows. At578MHz, frame p50 was
+17.27-17.30ms and GPU spans15.0-15.1ms; two post-ready500MHz windows measured
+20.14/20.12ms, GPU17.94ms and mean48.75/49.13FPS. Replay reports remained
+1453draws/frame across the four600frame windows. This correlates DVFS with frame
+cost without a cache toggle; it does not establish a controlled clock experiment
+or a fixed CPU-cache saving. Earlier578MHz windows preceded the explicit ready
+reply, and pass/shader work was not re-censused. GPU903MHz and CPU7 3.3024GHz
+occurred transiently, so neither is permanently pinned to the observed low
+clock. ADPF startup logged a16.67ms target; a mistaken30FPS hint target is excluded
+for this session. Why sustained GPU frequency falls remains unresolved.
+
+The preceding frequency-only collector's GPU polling was unavailable:80raw
+sys_stats packets contained640CPU samples and no GPU/devfreq fields. Checking a
+text-protocol field existed was insufficient: the device's Perfettov49 GPU
+poller implements Intel/AMD paths, whereas the newer source adds Adreno. A
+short capability trace accepted kgsl_pwrstats, pwrlevel, buslevel, constraint
+and thermal_constraint; gpubusy and pwr_set_state were absent and removed.
+Actual emitted power statistics and interval coverage must be checked in game
+before inferring utilization. These are device-wide counters, not game-exclusive.
+
+
+PJD110 hardware-load follow-up (2026-11-09) uses kgsl_pwrstats busy_time /
+total_time, with complete driver intervals inside confirmed300frame log windows.
+These are system-wide GPU counters; RAM counters remain raw. A755-779draw view
+produced59.61FPS over1800confirmed frames, with78.72%GPUbusy; stable500/578MHz
+interval groups were83.66%/71.79%busy. This was lighter than the historical slow
+view and does not establish the60FPS goal. A second, user-selected1260draw
+slowview measured about56FPS, frame p50 17.24-17.45ms and~80%GPUbusy. All598
+buslevel records held pwrlevel7, mapped to500MHz by the immediately preceding
+same-day capture. No frequency-change event occurred in that second trace;
+report the driver-level provenance rather than inventing a direct frequency read.
+Neither100%GPU saturation nor long GPU idling is established by that workload.
+
+Android16API exports alone are insufficient capability evidence. Both shell and
+actualappUID readonly APerformanceHint_isFeatureSupported queries returned
+sessions=true, surface_binding=false, graphics_pipeline=false, auto_cpu=false
+and auto_gpu=false. Do not add a surface/graphics-mode solution for this device
+on symbol presence alone. The service dump's paused-background status was read
+after screen-off and is not evidence that the session was paused during play.
+The next prepared diagnostic adds the existing adrenotools helpers with the
+system driver, first observe-only mode2, then owned-context mode1. Renderer ELF
+is byte-identical to the installed overlay-cache build. Property acceptance alone
+is insufficient: collect kernelconstraint activation, pwrlevel and hardware-load
+events from before newcontextcreation, retaining thermal/max bounds and never
+enabling the device-global power-control override. The observe-only mode2 diagnostic intercepted one real context, none flagged or
+requested, but measured only~40FPS at1262draws/frame versus the earlier normal
+path~56FPS at1260draws. Observe-only hooks and loader namespaces are not assumed
+performance-neutral. The experiment was aborted before mode1, DM_GPU_PERF=0
+restored the direct systemloader startup path, and the app was stopped to unload
+all helper namespaces. Existing rendering optimizations remain. Normal-path
+relaunch verification succeeded: app-UID maps contained no helper libraries. Six
+confirmed300frame windows at1251draws/frame averaged57.99FPS, frame p50
+16.91-17.08ms, GPU-span p50~13.27ms and systemGPUbusy79.24%. All589buslevel
+records held pwrlevel7. This is a separate-process observation with slightly
+different draw count, not a fixed-clock A/B or sustained60FPS proof. No
+owned-context request was enabled or retained; keep DM_GPU_PERF=0.
+
+The subsequent offline synchronization review identified queue-fence producers
+requesting ALL_GPU_COMMANDS_COMPLETE, not world-space-only completion. Keep full
+completion semantics. WindowAcquireTexture already names each image's historical
+present fence by default; do not reintroduce a supposed global-latest-fence fix.
+The Vulkan pipeline lookup already memoizes its last full key. A bounded
+four-frame existing DM_NVN_SEQ call-order capture completed in the same process
+(frames21791-21794,43events). Each frame submitted two NVN batches and fenced
+each before presenting; these are NVN calls, not Vulkan submission counts. All17
+wait calls traceable to a producer named an earlier frame (one or two frame IDs
+earlier); three initial calls had producers outside the capture. No same-frame
+submit-then-wait dependency or kind2 image-acquire sync wait was observed. This
+does not establish an additional high-gain NVN async opportunity: keep the
+current Vulkan parallel paths and leave DM_NVN_ASYNC off. Preserve acquire replay
+safety and full completion semantics. Logging expired after four frames, a later
+checkpoint verified expiry, and startup configuration was unchanged. No timing
+or FPS benefit is inferred from the synchronous diagnostic; other scenes and
+slow frames remain outside its scope.

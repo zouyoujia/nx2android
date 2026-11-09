@@ -9,6 +9,7 @@
 #include "nvn_hmap.h"
 #include "pass_census.h"
 #include "gpu_segments.h"
+#include "bind_batch.h"
 #include "texture_barrier.h"
 #include "nvn_dirty.h"
 #include "compute_warm_keys.h"
@@ -85,6 +86,20 @@ static inline uint64_t tick(void) {
 // Measurement switches, read again at every submission so DM_CTL "env" lines change them while the game runs (never for normal play: they draw wrong):
 // DM_VK_X_NOBAR=1 no barrier before a pass, DM_VK_X_DEPTH=1 depth neither loaded nor stored, DM_VK_X_COLOR=1 colour not loaded unless cleared
 static int g_x_nobar, g_x_depth, g_x_color, g_x_cbdraws, g_x_tracepass = -1, g_sub_pass;   // DM_VK_TRACE_PASS=n: log every draw of the submission's pass n (once)
+static int g_x_bind_batch;
+static int g_bind_batch_prof; static uint64_t g_bind_batch_counts[2][2];
+static void bind_batch_count(unsigned kind, uint64_t original, uint64_t actual) {
+    if (!__atomic_load_n(&g_bind_batch_prof, __ATOMIC_RELAXED)) return;
+    __atomic_fetch_add(&g_bind_batch_counts[kind][0], original, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_bind_batch_counts[kind][1], actual, __ATOMIC_RELAXED);
+}
+void vk_bind_batch_report(uint64_t frame) {
+    if (frame % 300 || !__atomic_load_n(&g_bind_batch_prof, __ATOMIC_ACQUIRE)) return;
+    static uint64_t prev[2][2]; uint64_t d[2][2];
+    for (int k = 0; k < 2; k++) for (int i = 0; i < 2; i++) { uint64_t v = __atomic_load_n(&g_bind_batch_counts[k][i], __ATOMIC_RELAXED); d[k][i] = v - prev[k][i]; prev[k][i] = v; }
+    VKLOG("bind batching through frame %llu: stencil equivalent/actual %llu/%llu; vertex equivalent/actual %llu/%llu; complete state is still emitted per draw",
+        (unsigned long long)frame, (unsigned long long)d[0][0], (unsigned long long)d[0][1], (unsigned long long)d[1][0], (unsigned long long)d[1][1]);
+}
 static int g_x_listpasses;
 static int g_x_dedup_adj_barrier;   // DM_VK_DEDUP_ADJ_BARRIER=1 (live): skip only literal adjacent nonzero full barriers
 static void texture_barrier_config(void);
@@ -205,7 +220,9 @@ void vk_watch(const vkimg_t *im, const char *what) {
     g_watch_n--; VKLOG("watch: present %llu pass %d (%ux%u): %s %ux%u fmt %d pool %#llx+%#llx (image %p, nvn flags %#x, %d overlapping)", (unsigned long long)g_tex_frame, g_sub_pass - 1, S.pass_w, S.pass_h, what, im->w, im->h, im->fmt,
                        (unsigned long long)im->pool, (unsigned long long)im->off, (const void *)im, im->flags, im->novl);
 }
-static void x_read(void) { texture_barrier_config(); pass_census_refresh(g_tex_frame); const char *c = getenv("DM_VK_CB_DRAWS"); g_x_cbdraws = c ? atoi(c) : 128; g_sub_pass = 0;
+static void x_read(void) { vk_dq_refresh(); texture_barrier_config(); pass_census_refresh(g_tex_frame); const char *c = getenv("DM_VK_CB_DRAWS"); g_x_cbdraws = c ? atoi(c) : 128; g_sub_pass = 0;
+    { const char *b = getenv("DM_VK_BIND_BATCH"), *p = getenv("DM_VK_BIND_BATCH_PROF"); g_x_bind_batch = b && atoi(b) == 1;
+      __atomic_store_n(&g_bind_batch_prof, p && atoi(p) == 1, __ATOMIC_RELEASE); }
     const char *fy = getenv("DM_VK_FLIPY"); g_flipy = !(fy && !atoi(fy));   // on unless DM_VK_FLIPY=0
     if (g_x_listpasses) { g_x_listpasses = 0; setenv("DM_VK_TRACE_PASS", "-1", 1); }
     const char *tp = getenv("DM_VK_TRACE_PASS"); g_x_tracepass = tp ? atoi(tp) : -1;
@@ -384,11 +401,12 @@ static int texture_barrier_end(enum vk_pass_end_reason reason, uint32_t mask) {
 static void texture_barrier_config(void) {
     const char *e = getenv("DM_VK_TEXTURE_BARRIER"); int mode = e ? atoi(e) : 0; if (mode < 0 || mode > 2) mode = 0;
     // DQB2 gameplay hit the conservative 128-draw limit ~6.11 times/frame.
+    // A later 512-window capture still ends once/frame on the cap.
     // Longer windows still check every read/writer/epoch; never allow unlimited
     // deferral or change the separate command-buffer/depth safety protections.
     const char *d = getenv("DM_VK_TEXTURE_BARRIER_DRAWS"); char *end = NULL;
     long limit = d ? strtol(d, &end, 10) : 128;
-    if (!d || end == d || *end || limit < 128 || limit > 512) limit = 128;
+    if (!d || end == d || *end || limit < 128 || limit > 1024) limit = 128;
     if (mode != g_tb_mode || (uint32_t)limit != g_tb_draw_limit) {
         texture_barrier_flush(TB_NATURAL); g_tb_mode = mode; g_tb_draw_limit = (uint32_t)limit;
         memset(g_tb_stats, 0, sizeof g_tb_stats); g_tb_since = g_tex_frame; g_tb_report = UINT64_MAX;
@@ -1335,6 +1353,7 @@ static VkPipeline build_pipeline(const pkey *k, VkPipelineLayout layout, vkshade
     VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, prp ? NULL : &rci, 0, ns, ss, &vi, &ia, NULL, &vs, &rs, &ms, &ds, &cb, &dy, layout, prp, 0, VK_NULL_HANDLE, -1};
     if (bs >= 0) g_build[bs].phase = 2;
     VkResult r = vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &ci, NULL, &p);
+    if (r == VK_SUCCESS && g_vk_pipeline_exec_enabled) vk_pipeline_exec_capture(&ci, k, sizeof *k, k->key[0], fs);
     build_end(bs);
     static uint64_t n; uint64_t c = __atomic_add_fetch(&n, 1, __ATOMIC_RELAXED);
     if (r) { LOG("[RED] [vk] graphics pipeline failed (%d): shaders %016llx %016llx %016llx", r, (unsigned long long)k->key[0], (unsigned long long)k->key[1], (unsigned long long)k->key[2]); p = (VkPipeline)1; }
@@ -1543,7 +1562,20 @@ static int set_memo_get(int st, vkshader_t *s, uint32_t *dofs) {
     return 1;
 }
 // dofs (at least s->ndyn entries): the dynamic offsets of the set's dynamic uniform buffers, in binding order as vkCmdBindDescriptorSets takes them
+static void linear_shader_writes(int st, const vkshader_t *s) {
+    if (!s->linear_writes || !vk_linear_cache_mode()) return;
+    if (s->linear_writes & 2) { vk_linear_unknown_write(); return; }
+    for (int i = 0; i < s->nbind; i++) { const dmsv_bind *b = &s->b[i]; uint64_t a = 0, n = 0;
+        if (b->kind == RK_SBUF && b->reg >= 0 && b->reg < 16) { a = S.ssbo[st][b->reg].addr; n = S.ssbo[st][b->reg].size; }
+        else if (b->kind == RK_SBUF_UBO) a = (uint64_t)ubo_word(st, b->reg, b->off) | (uint64_t)ubo_word(st, b->reg, b->off + 4) << 32;
+        else continue;
+        vkpool_t *p = a ? vk_pool_of(a, 1) : NULL; if (!p) continue; // actual descriptor uses the private dummy
+        uint64_t off = a - p->lo; if (!n || n > p->hi - a) n = p->hi - a;
+        vk_linear_buffer_wrote(a - off % SB_ALIGN, n + off % SB_ALIGN);
+    }
+}
 static VkDescriptorSet stage_set(int st, vkshader_t *s, uint32_t *dofs) {
+    linear_shader_writes(st, s);
     // Check before descriptor memo hits: storage/unknown descriptors can write beyond tracked transfer ranges.
     if (vk_readback_ranges()) for (int i = 0; i < s->nbind; i++) {
         int d = s->b[i].desc;
@@ -1736,17 +1768,32 @@ static void set_dynamic(VkCommandBuffer cb) {
       if (sw == 0x100) { vp.y += vp.height; vp.height = -vp.height; }
       else if (sw) VKRED_ONCE(81, "viewport swizzle %d,%d,%d,%d not implemented (drawn unswizzled)", S.vp_sw[0][0], S.vp_sw[0][1] ^ 2, S.vp_sw[0][2] ^ 4, S.vp_sw[0][3] ^ 6); }
     if (vp.minDepth < 0) vp.minDepth = 0; if (vp.maxDepth > 1) vp.maxDepth = 1;
+    VkRect2D sc = scissor_rect();
+    if (fresh) {
+        vk_dq_dynamic_state a = {.vp = vp, .sc = sc, .bias = S.pofs.units, .clamp = S.pofs.clamp, .slope = S.pofs.factor, .stencil_batch = g_x_bind_batch};
+        memcpy(a.blend, S.blendc, sizeof a.blend); memcpy(a.sm, S.smask, sizeof a.sm);
+        memcpy(a.sw, S.swmask, sizeof a.sw); memcpy(a.sr, S.sref, sizeof a.sr);
+        if (vk_dq_dynamic(cb, &a)) {
+            g_bc.vp = vp; g_bc.sc = sc; memcpy(g_bc.bc, S.blendc, sizeof g_bc.bc); memcpy(g_bc.sm, S.smask, sizeof g_bc.sm);
+            memcpy(g_bc.sw, S.swmask, sizeof g_bc.sw); memcpy(g_bc.sr, S.sref, sizeof g_bc.sr); g_bc.po = S.pofs; g_bc.line = 1;
+            bind_batch_count(0, 6, (g_x_bind_batch && a.sm[0] == a.sm[1] ? 1 : 2) +
+                (g_x_bind_batch && a.sw[0] == a.sw[1] ? 1 : 2) + (g_x_bind_batch && a.sr[0] == a.sr[1] ? 1 : 2));
+            goto bounds;
+        }
+    }
     if (!BC_SAME(vp, vp)) { vkCmdSetViewport(cb, 0, 1, &vp); g_bc.vp = vp; }
-    VkRect2D sc = scissor_rect(); if (!BC_SAME(sc, sc)) { vkCmdSetScissor(cb, 0, 1, &sc); g_bc.sc = sc; }
+    if (!BC_SAME(sc, sc)) { vkCmdSetScissor(cb, 0, 1, &sc); g_bc.sc = sc; }
+
+    if (!BC_SAME(bc, S.blendc)) { vkCmdSetBlendConstants(cb, S.blendc); memcpy(g_bc.bc, S.blendc, sizeof g_bc.bc); }
+    if (!BC_SAME(sm, S.smask)) { unsigned n = vk_stencil_pair(cb, vkCmdSetStencilCompareMask, (uint32_t)S.smask[0], (uint32_t)S.smask[1], g_x_bind_batch); bind_batch_count(0, 2, n); memcpy(g_bc.sm, S.smask, sizeof g_bc.sm); }
+    if (!BC_SAME(sw, S.swmask)) { unsigned n = vk_stencil_pair(cb, vkCmdSetStencilWriteMask, (uint32_t)S.swmask[0], (uint32_t)S.swmask[1], g_x_bind_batch); bind_batch_count(0, 2, n); memcpy(g_bc.sw, S.swmask, sizeof g_bc.sw); }
+    if (!BC_SAME(sr, S.sref)) { unsigned n = vk_stencil_pair(cb, vkCmdSetStencilReference, (uint32_t)S.sref[0], (uint32_t)S.sref[1], g_x_bind_batch); bind_batch_count(0, 2, n); memcpy(g_bc.sr, S.sref, sizeof g_bc.sr); }
+    if (!BC_SAME(po, S.pofs)) { vkCmdSetDepthBias(cb, S.pofs.units, S.pofs.clamp, S.pofs.factor); g_bc.po = S.pofs; }
+    if (fresh || !g_bc.line) { vkCmdSetLineWidth(cb, 1.0f); g_bc.line = 1; }
+bounds:
     { int32_t vx0 = (int32_t)fmaxf(vp.x, 0), vy0 = (int32_t)fmaxf(fminf(vp.y, vp.y + vp.height), 0), vx1 = (int32_t)(vp.x + vp.width), vy1 = (int32_t)fmaxf(vp.y, vp.y + vp.height);   // what this draw can touch
       int32_t x0 = sc.offset.x > vx0 ? sc.offset.x : vx0, y0 = sc.offset.y > vy0 ? sc.offset.y : vy0, x1 = sc.offset.x + (int32_t)sc.extent.width < vx1 ? sc.offset.x + (int32_t)sc.extent.width : vx1, y1 = sc.offset.y + (int32_t)sc.extent.height < vy1 ? sc.offset.y + (int32_t)sc.extent.height : vy1;
       if (x0 < g_pass_bb[0]) g_pass_bb[0] = x0; if (y0 < g_pass_bb[1]) g_pass_bb[1] = y0; if (x1 > g_pass_bb[2]) g_pass_bb[2] = x1; if (y1 > g_pass_bb[3]) g_pass_bb[3] = y1; }
-    if (!BC_SAME(bc, S.blendc)) { vkCmdSetBlendConstants(cb, S.blendc); memcpy(g_bc.bc, S.blendc, sizeof g_bc.bc); }
-    if (!BC_SAME(sm, S.smask)) { vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_FRONT_BIT, (uint32_t)S.smask[0]); vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_BACK_BIT, (uint32_t)S.smask[1]); memcpy(g_bc.sm, S.smask, sizeof g_bc.sm); }
-    if (!BC_SAME(sw, S.swmask)) { vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_BIT, (uint32_t)S.swmask[0]); vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_BACK_BIT, (uint32_t)S.swmask[1]); memcpy(g_bc.sw, S.swmask, sizeof g_bc.sw); }
-    if (!BC_SAME(sr, S.sref)) { vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_BIT, (uint32_t)S.sref[0]); vkCmdSetStencilReference(cb, VK_STENCIL_FACE_BACK_BIT, (uint32_t)S.sref[1]); memcpy(g_bc.sr, S.sref, sizeof g_bc.sr); }
-    if (!BC_SAME(po, S.pofs)) { vkCmdSetDepthBias(cb, S.pofs.units, S.pofs.clamp, S.pofs.factor); g_bc.po = S.pofs; }
-    if (fresh || !g_bc.line) { vkCmdSetLineWidth(cb, 1.0f); g_bc.line = 1; }
 }
 static int g_no_cull = -1;
 // When the driver refuses a submission (vkEndCommandBuffer), the next ones find the draw it refuses: only draws below a limit are recorded, the limit
@@ -1763,7 +1810,30 @@ static void rd_read(const uint64_t *a, int n) {
         int dup = 0; for (int j = 0; j < ns; j++) dup |= seen[j] == b; if (dup) continue; seen[ns++] = b;
         vk_scratch(4, 4, &db, &dof); VkBufferCopy r = {o, dof, 4}; vk_img_barrier_all(cb); vkCmdCopyBuffer(cb, b, db, 1, &r); vk_img_barrier_all(cb); }
 }
-// everything a draw needs bound; 0 when the draw cannot be done (logged once per reason)
+// Selected sample frames only. Registry reads do not create/refresh images or
+// descriptor sets. Unhandled/overflowed bindings are explicit, never "no hazard".
+static void gpu_draw_detail(int discard) {
+    if (!vk_gpu_segment_active()) return;
+    vk_gd_draw d = {0}; d.count = 1; d.vs = S.sh[0] ? S.sh[0]->key : 0; d.fs = !discard && S.sh[1] ? S.sh[1]->key : 0;
+    for (int i = 0; i < S.rt_n && i < 8; i++) if (S.rt_has_col[i] && P_att[i].im) d.target[i] = (uint64_t)(uintptr_t)S.rt_col[i].mem;
+    if (S.rt_has_dep && P_att[8].im) d.target[8] = (uint64_t)(uintptr_t)S.rt_dep.mem;
+    if (S.sh[2]) d.unknown++;
+    for (int st = 0; st < 3; st++) if (S.sh[st] && !(st == 1 && discard)) for (unsigned i = 0; i < (unsigned)S.sh[st]->nbind; i++) {
+        const dmsv_bind *b = &S.sh[st]->b[i];
+        if (b->kind != RK_TEX && b->kind != RK_TEX_UBO && b->kind != RK_TEX_C2A) { if (b->kind == RK_TEXD || b->kind == RK_IMG || b->kind == RK_IMG_UBO) d.unknown++; continue; }
+        unsigned count = b->count ? b->count : 32;
+        for (unsigned j = 0; j < count; j++) {
+            if (d.ntex == VK_GD_TEXTURES) { d.unknown += count - j; break; }
+            uint64_t h = b->kind == RK_TEX ? vk_tex_slot_handle(S.tex[st], S.img[st], (unsigned)b->reg) :
+                b->kind == RK_TEX_UBO ? mem_handle(ubo_word(st, b->reg, b->off + 8 * j)) : (b->off >= 0 ? c2_handle(st, b->off + 8 * j) : 0);
+            const tex_t *t = NULL; const view_t *v = NULL;
+            if (h && vk_tex_by_id((int)(h & 0xfffff), &v, &t) && t) d.texture[d.ntex++] = (uint64_t)(uintptr_t)t->mem;
+            else { d.texture[d.ntex++] = 0; d.unknown++; }
+        }
+    }
+    vk_gpu_segment_draw(&d);
+}
+// Everything a draw needs bound; 0 when the draw cannot be done.
 static int prepare_draw(int prim, int indexed) {
     // DM_VK_CB_DRAWS (read every submission, default 128, 0 = never): the replay is cut every that many draws and what is recorded goes to the GPU at once
     // (vk_cmd_split), so the GPU works on the frame while the rest is replayed instead of after all of it: NEO's Scramble Crossing 36.7 → 15.7 ms a frame
@@ -1811,7 +1881,7 @@ static int prepare_draw(int prim, int indexed) {
     if (!begin_pass() || !pass_commit()) { g_vkst.skip_rt++; return 0; }
     if (g_tb_mode) g_tb_pass_unsafe |= g_tb_this_unsafe;
     if (g_x_tracepass >= 0 && g_sub_pass - 1 == g_x_tracepass) g_tracing = 1;
-    uint64_t t0 = tick();
+    uint64_t t0 = tick(), cgen = g_cmd_gen;
     VkCommandBuffer cb = vk_cmd();
     if (g_no_cull < 0) g_no_cull = getenv("DM_VK_NOCULL") != NULL;
     pkey k; memset(&k, 0, sizeof k);
@@ -1886,7 +1956,7 @@ static int prepare_draw(int prim, int indexed) {
     uint32_t dofs[5][96], ndofs = 0, dall[3 * 96];
     uint64_t t1d = tick();
     for (int st = 0; st < 3; st++) if (S.sh[st] && !(st == 1 && k.raster_discard)) { sets[S.sh[st]->set] = stage_set(st, S.sh[st], dofs[S.sh[st]->set]); k.um[st] = g_num_um; k.im[st] = g_num_im; }
-    uint64_t tdesc = tick() - t1d; g_vkst.ns_desc += tdesc; if (g_prof_on) g_prof_ns[5] += tdesc;
+    uint64_t tdesc = tick() - t1d; if (g_vk_cpu_sections) vk_gpu_cpu_add(VK_GS_CPU_DESC, tdesc, cgen); g_vkst.ns_desc += tdesc; if (g_prof_on) g_prof_ns[5] += tdesc;
     if (texture_barrier_recheck()) { g_cb_draws--; return prepare_draw(prim, indexed); }
     if (g_tracing) {
         VKLOG("  pipeline: topology %u restart %u discard %u cull %u front %u mode %u clamp %u bias %u; depth test %u write %u func %u stencil %u; attributes %u bindings %u; colour %u (format %u) samples %u a2c %u; blend enable %#x logic %u/%u; fragment depth variant %u (depth written by a shader at present %llu, now %llu)",
@@ -1900,14 +1970,20 @@ static int prepare_draw(int prim, int indexed) {
     }
     crumb_draw(k.key[0], k.key[1], k.key[2]);
     VkPipeline p = graphics_pipeline(&k, layout);
-    uint64_t t1 = tick(); g_vkst.ns_pipe += t1 - t0 - tdesc;
+    uint64_t t1 = tick(); if (g_vk_cpu_sections) vk_gpu_cpu_add(VK_GS_CPU_PIPE, t1 - t0 - tdesc, cgen); g_vkst.ns_pipe += t1 - t0 - tdesc;
     if (!p) { g_vkst.skip_pipe++; return 0; }
     if (g_ubolog_key && g_ubolog_n > 0 && S.sh[0] && S.sh[0]->key == g_ubolog_key) {   // DM_VK_UBO_LOG: the pipeline the draw got, and its key's hash
         uint64_t kh = fnv(1469598103934665603ull, &k, sizeof k); VKLOG("ubo: present %llu pipeline %p key %016llx um %llx/%llx im %llx/%llx", (unsigned long long)g_tex_frame, (void *)p, (unsigned long long)kh,
               (unsigned long long)k.um[0], (unsigned long long)k.um[1], (unsigned long long)k.im[0], (unsigned long long)k.im[1]); }
+    gpu_draw_detail(k.raster_discard);
     g_vkst.draws++; if (++g_pass_draws > g_vkst.max_pass_draws) g_vkst.max_pass_draws = g_pass_draws;
+    uint64_t c_api_tick = g_vk_cpu_sections ? tick() : 0, c_api_gen = g_cmd_gen;
     if (p != S.bound_pipe) { uint64_t tb = g_prof_on ? tick() : 0; vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p); S.bound_pipe = p; if (g_prof_on) g_prof_ns[4] += tick() - tb; }
+    if (c_api_tick) vk_gpu_cpu_add(VK_GS_CPU_BIND_PIPE, tick() - c_api_tick, c_api_gen);
+    c_api_tick = g_vk_cpu_sections ? tick() : 0; c_api_gen = g_cmd_gen;
     set_dynamic(cb);
+    if (c_api_tick) vk_gpu_cpu_add(VK_GS_CPU_DYNAMIC, tick() - c_api_tick, c_api_gen);
+    c_api_tick = g_vk_cpu_sections ? tick() : 0; c_api_gen = g_cmd_gen;
     if (var == 1) { vkCmdSetDepthBias(cb, 0, 0, 0); memset(&g_bc.po, 0xff, sizeof g_bc.po); }
     uint32_t at[6] = {0};   // where each set's dynamic offsets start in dall
     for (int i = 0; i < nsets; i++) { at[i] = ndofs; for (int st = 0; st < 3; st++)   // the dynamic offsets: by set, then binding
@@ -1925,6 +2001,10 @@ static int prepare_draw(int prim, int indexed) {
         if (fresh || g_bc.lay != layout || g_bc.nsets != (uint32_t)nsets || g_bc.ndofs != ndofs || memcmp(g_bc.sets, sets, sizeof *sets * (size_t)nsets) || memcmp(g_bc.dofs, dall, sizeof *dall * ndofs)) {
             vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, (uint32_t)nsets, sets, ndofs, dall);
             g_bc.lay = layout; g_bc.nsets = (uint32_t)nsets; g_bc.ndofs = ndofs; memcpy(g_bc.sets, sets, sizeof *sets * (size_t)nsets); memcpy(g_bc.dofs, dall, sizeof *dall * ndofs); } }
+    if (c_api_tick) vk_gpu_cpu_add(VK_GS_CPU_BIND_DESC, tick() - c_api_tick, c_api_gen);
+    c_api_tick = g_vk_cpu_sections ? tick() : 0; c_api_gen = g_cmd_gen;
+    // Within-draw batching keeps every original binding, including full-rebind mode.
+    VkBuffer vb_batch[17]; VkDeviceSize vo_batch[17]; uint32_t vb_mask = 0;
     // vertex buffers
     for (uint32_t i = 0; i < k.nbind; i++) {
         uint32_t b = k.bind[i].binding; VkBuffer buf; VkDeviceSize off;
@@ -1932,8 +2012,11 @@ static int prepare_draw(int prim, int indexed) {
         else if (!vk_buf_at(S.vbuf[b].address, 1, &buf, &off)) { buf = vk_zero_buffer(); off = 0; VKRED_ONCE(51, "vertex buffer outside the memory pools"); }
         else if (S.vbuf[b].size) { vkpool_t *vp = vk_pool_of(S.vbuf[b].address, 1); if (vp && S.vbuf[b].address + S.vbuf[b].size > vp->hi && vp->hi < vp->end) vk_cross(2, S.vbuf[b].address, S.vbuf[b].size, vp); }
         if (g_var_now == 5) { buf = vk_zero_buffer(); off = 0; }
-        if (!(dbg_draw() & 2) && b < 17) { int fresh = bc_fresh(); if (fresh || g_bc.vb[b] != buf || g_bc.vo[b] != off) { vkCmdBindVertexBuffers(cb, b, 1, &buf, &off); g_bc.vb[b] = buf; g_bc.vo[b] = off; } }
+        if (!(dbg_draw() & 2) && b < 17) { int fresh = bc_fresh(); if (fresh || g_bc.vb[b] != buf || g_bc.vo[b] != off) { if (g_x_bind_batch) { vb_mask |= 1u << b; vb_batch[b] = buf; vo_batch[b] = off; }
+            else { vkCmdBindVertexBuffers(cb, b, 1, &buf, &off); bind_batch_count(1, 1, 1); } g_bc.vb[b] = buf; g_bc.vo[b] = off; } }
     }
+    if (vb_mask) { unsigned n = vk_vertex_runs(cb, vb_mask, vb_batch, vo_batch, vkCmdBindVertexBuffers); bind_batch_count(1, (unsigned)__builtin_popcount(vb_mask), n); }
+    if (c_api_tick) vk_gpu_cpu_add(VK_GS_CPU_VERTEX, tick() - c_api_tick, c_api_gen);
     (void)indexed;
     return 1;
 }
@@ -2631,6 +2714,7 @@ static void exec_ops(const uint8_t *p) {
         static uint64_t skip = ~0ull; if (skip == ~0ull) { skip = 0; const char *e = getenv("DM_VK_SKIP_OPS"); for (const char *q = e; q && *q;) { char *n; long v = strtol(q, &n, 10); if (n == q) break; if (v > 0 && v < 64) skip |= 1ull << v; q = *n ? n + 1 : n; } }   // debugging: record ops not replayed
         if (h.op < 64 && h.op > 3 && (skip >> h.op & 1)) { adjacent.nonzero = 0; p += h.size; continue; }
         const uint8_t *a = p + 8;
+        uint64_t cp_tick = g_vk_cpu_sections && h.op > 3 ? tick() : 0, cp_gen = g_cmd_gen;
         texture_barrier_record(h.op, a);
         switch (h.op) {
         case OP_END: return;
@@ -2699,6 +2783,7 @@ static void exec_ops(const uint8_t *p) {
         case OP_VP_SWIZZLE: { const p_vp_swizzle *b = (const p_vp_swizzle *)a; memcpy(S.vp_sw[b->first], b->sw, 4 * (size_t)b->n); break; }
         default: VKRED_ONCE(82, "unknown record op %u", h.op); break;
         }
+        if (cp_tick) vk_gpu_cpu_add(VK_GS_CPU_OP + h.op, tick() - cp_tick, cp_gen);
         p += h.size;
     }
 }

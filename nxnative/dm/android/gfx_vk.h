@@ -49,6 +49,7 @@ VK_FNS(VK_DECL) VK_DEV_FNS(VK_DECL)
 
 // Every queue submit/present calls this while g_vk_queue_mu is held.
 void vk_queue_changed(void);
+void vk_queue_present(uint64_t ticket);   // queue mutex held; metadata only
 
 // ---- device ----
 typedef struct {
@@ -63,6 +64,10 @@ typedef struct {
     uint32_t sg_size, sg_stages, sg_ops, sg_quad_all, sg_min, sg_max, sg_maxwgs, sg_pin_stages; VkPipelineShaderStageRequiredSubgroupSizeCreateInfo sg_pin;
 } vkdev_t;
 extern vkdev_t V;
+// Startup-only compiler diagnostics; private clones never replace the rendering pipeline.
+extern int g_vk_pipeline_exec_enabled;
+int vk_pipeline_exec_requested(void);
+void vk_pipeline_exec_init(int enabled);
 const void *vk_sg_pin(VkShaderStageFlagBits stage, const uint32_t *local);   // DM_VK_SUBGROUP_PIN: a game pipeline stage's pNext, NULL when the driver picks its size (local: a compute shader's workgroup size)
 // gfx_vk_subgroup.c (no Vulkan): the module as subgroups of one invocation when it uses a subgroup class not in ops (its stage's; 0 when the device has none there).
 // NULL when there is nothing the stage lacks (why empty) or it uses something not covered (why names it); the module then stays as it is
@@ -95,6 +100,27 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout l);    // from this submissio
 // Optional sparse GPU completion intervals; token 0 records no timestamp.
 uint32_t vk_gpu_segment_begin(uint32_t kind, uint64_t tag, uint32_t w, uint32_t h);
 void vk_gpu_segment_end(uint32_t token, uint32_t count);
+extern int g_vk_cpu_sections; // selected sparse submissions only; normal replay reads no extra clocks
+void vk_gpu_cpu_add(unsigned kind, uint64_t ns, uint64_t epoch);
+#include "gpu_detail.h"
+void vk_gpu_upload_note(unsigned kind, uint64_t bytes);
+int vk_ubd_overlaps(uint64_t a, uint64_t n);
+int vk_linear_cache_mode(void);
+uint64_t vk_linear_write_stamp(void);
+int vk_linear_writes_changed(uint64_t stamp, uint64_t a, uint64_t n);
+int vk_linear_writes_pending(uint64_t a, uint64_t n);
+void vk_linear_buffer_wrote(uint64_t a, uint64_t n);
+void vk_linear_unknown_write(void);
+void vk_linear_present(uint64_t frame);
+void vk_bind_batch_report(uint64_t frame);
+// One copied FIFO record, with every driver call and argument preserved.
+typedef struct { VkViewport vp; VkRect2D sc; float blend[4]; uint32_t sm[2], sw[2], sr[2];
+                 float bias, clamp, slope; int stencil_batch; } vk_dq_dynamic_state;
+int vk_dq_dynamic(VkCommandBuffer cb, const vk_dq_dynamic_state *state);
+void vk_dq_refresh(void);
+void vk_dq_report(uint64_t frame);
+int vk_gpu_segment_active(void);
+void vk_gpu_segment_draw(const vk_gd_draw *draw);
 void vk_gpu_segments_request(int n);
 uint64_t vk_fence_done(void);   // the highest submission fence the GPU has completed
 
@@ -120,6 +146,7 @@ struct vkimg {
     uint64_t fdz_frame;             // depth images: 1 + the present at which a fragment shader that replaces depth last wrote it (gfx_vk_exec.c fdz)
     int gpu_w;                      // the GPU wrote it: an attachment, a storage image, a copy or clear destination (gfx_vk_exec.c); lin_copy keeps that until the CPU writes its storage
     uint64_t lin_stamp; const void *lin_span; const uint8_t *lin_mem; size_t lin_len;   // lin_copy: the storage watched since the GPU wrote it
+    const void *lc_mem, *lc_span; size_t lc_len; uint64_t lc_stamp, lc_writes; int lc_valid;
     uint64_t lin_gen;               // linear textures: the upload command buffer (g_up_gen) that last copied it from its pool (vk_tex: lin_copy)
     uint64_t depth_sub;   // the submission (gfx_vk_exec.c g_set_epoch) whose passes last used it as their depth attachment
     uint64_t depth_cut;   // and the command buffer within it (gfx_vk_exec.c g_cuts)
@@ -164,7 +191,7 @@ typedef struct {
     uint64_t key; int stage;          // NVN stage: 0 vertex 1 fragment 2 geometry 3 tess control 4 tess eval 5 compute
     VkShaderModule mod;
     VkDescriptorSetLayout dsl; int set;   // the set this stage's bindings were moved to (vertex 0, fragment 1, geometry 2, compute 0)
-    int nbind; const dmsv_bind *b;
+    int nbind; const dmsv_bind *b; unsigned linear_writes;   // conservative reflection write class: 0 readonly, 1 SSBO ranges, 2 opaque
     const uint8_t *c1; uint32_t c1_len; VkBuffer c1_buf; VkDeviceSize c1_off;
     uint32_t local[3];
     uint8_t dyn[96]; int ndyn;          // bindings of uniform buffers bound with a dynamic offset (gfx_vk_exec.c stage_set), and their count
@@ -176,6 +203,7 @@ typedef struct {
     uint32_t in_locs, out_locs;         // the vec4 (or per-vertex vec4) inputs and outputs it declares, by location
     int setmemo;                        // gfx_vk_exec.c stage_set: 1 its set may be memoized per stage, 2 not (it reads handles or addresses from uniform buffer memory), 0 not known yet
 } vkshader_t;
+void vk_pipeline_exec_capture(const VkGraphicsPipelineCreateInfo *ci, const void *state, size_t bytes, uint64_t vs, const vkshader_t *fs);
 vkshader_t *vk_shader(uint64_t key, int stage);   // NULL when the bundle has no such shader
 vkshader_t *vk_shader_gs_topo(vkshader_t *gs, VkPrimitiveTopology topo);   // the geometry shader translated for the draw's input primitive (shader_vk.py gs_variant_key); gs when there is none
 VkShaderModule vk_shader_module(vkshader_t *s, uint64_t um, uint64_t im, uint32_t xo, int fd);   // the module, or its variant (integer views; extra outputs; fragment depth written)

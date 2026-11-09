@@ -39,7 +39,7 @@ static int counted_lock(pthread_mutex_t *m) {atomic_fetch_add(&observed_locks,1)
 static int counted_unlock(pthread_mutex_t *m) {atomic_fetch_add(&observed_unlocks,1);return pthread_mutex_unlock(m);}
 static int counted_wait(pthread_cond_t *c,pthread_mutex_t *m,const struct timespec *t) {atomic_fetch_add(&observed_waits,1);return pthread_cond_timedwait(c,m,t);}
 static int counted_broadcast(pthread_cond_t *c) {atomic_fetch_add(&observed_broadcasts,1);return pthread_cond_broadcast(c);}
-static int g_sync_prof=1;
+static int g_sync_prof=1,g_linear_mode,g_linear_invalid;
 static uint64_t sync_clock(void) {if(!g_sync_prof)return 0;struct timespec t;counted_clock(CLOCK_MONOTONIC,&t);return (uint64_t)t.tv_sec*1000000000+t.tv_nsec;}
 static void sync_add(int kind,uint64_t begin) {(void)kind;(void)begin;}
 static pthread_mutex_t g_done_mu=PTHREAD_MUTEX_INITIALIZER;

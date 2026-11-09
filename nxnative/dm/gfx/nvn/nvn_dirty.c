@@ -277,6 +277,22 @@ int nvn_dirty_since_span(const void *span, const void *addr, size_t len, uint64_
     for (uintptr_t i = p; i <= q; i++) if (atomic_load(&r->gen[i]) > stamp) return 1;   // The generation of the last write before upload is <= the stamp; any later write must be > the stamp
     return 0;
 }
+int nvn_dirty_collect(const void *span, const void *addr, size_t len, uint64_t stamp, nvn_dirty_interval *out, int cap) {
+    if (!len) return 0;
+    uintptr_t a = (uintptr_t)addr; if (!out || cap < 1 || len > UINTPTR_MAX - a) return -1;
+    range_t *r = (range_t *)span;
+    if (!r || !atomic_load_explicit(&r->live, memory_order_acquire) || a < r->base || a + len > r->end) r = find_span(a, len);
+    if (!r) return -1;
+    if (atomic_load(&r->last) <= stamp) return 0;
+    uintptr_t p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift; int n = 0;
+    for (uintptr_t i = p; i <= q; i++) if (atomic_load(&r->gen[i]) > stamp) {
+        uintptr_t lo = r->base + (i << g_shift), hi = lo + ((uintptr_t)1 << g_shift);
+        if (lo < a) lo = a; if (hi > a + len) hi = a + len;
+        if (n && out[n-1].offset + out[n-1].length == lo - a) out[n-1].length = hi - a - out[n-1].offset;
+        else { if (n == cap) return -1; out[n++] = (nvn_dirty_interval){lo - a, hi - lo}; }
+    }
+    return n;
+}
 int nvn_dirty_since(const void *addr, size_t len, uint64_t stamp) { return nvn_dirty_since_span(NULL, addr, len, stamp); }
 void nvn_dirty_slot_stats(int *live, int *used_slots, uint64_t *adds_total) {
     int n = atomic_load(&g_nr), active = 0;

@@ -8,6 +8,8 @@
 #include "nvn_tex.h"
 #include "../gfx/tex/nvn_deswizzle.h"
 #include "nvn_hmap.h"
+#include "nvn_dirty.h"
+#include "linear_upload.h"
 #include <string.h>
 #include "../gfx/tex/nvn_bc.h"
 
@@ -307,7 +309,7 @@ static void pkg_upload_(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
               (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, f->vk, t->d.target, im->levels, im->layers, t->d.flags, t->d.stride, (unsigned long long)t->L.size,
               (const void *)t->mem, (int)t->L.tileH * 100 + t->d.pkg_block_h, im->packaged > 1 ? " (again)" : ""); } }
     if (im->packaged < 100) im->packaged++;
-    VkCommandBuffer cb = vk_upload_cmd();
+    VkCommandBuffer cb = vk_upload_cmd(); vk_gpu_upload_note(0, t->L.size);
     if (im->layout != VK_IMAGE_LAYOUT_GENERAL) vk_tex_prepare(cb, im);
     nvn_dirty_protect(t->mem, t->L.size);
     im->pkg_stamp = nvn_dirty_now(); im->pkg_span = nvn_dirty_span(t->mem, t->L.size); im->pkg_seen = im->pkg_stamp;
@@ -365,7 +367,8 @@ extern uint64_t g_tex_frame;   // presents so far, for the packaged textures' la
 // last EVICT_KEEP presents go (their memory now holds another texture; one drawn again is made and filled again). Called with g_img_mu held
 enum { EVICT_KEEP = 60 };
 static uint64_t g_img_n, g_img_bytes, g_img_evicted;   // live images and their bytes, images evicted so far (vk_tex_sweep's line)
-static void img_drop(vkimg_t *im) { vk_lrz_forget(im); if (im->lin_mem) nvn_dirty_release(im->lin_mem, im->lin_len); if (im->packaged && !im->pkg_released && im->pkg_mem) nvn_dirty_release(im->pkg_mem, im->pkg_len); g_img_n--; g_img_bytes -= im->size > 0 ? (uint64_t)im->size : 0; alias_unlink(im); pool_image_del(im); vk_tex_view_drop_all(im); if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem); free(im); }
+static void linear_cache_forget(vkimg_t *im);
+static void img_drop(vkimg_t *im) { linear_cache_forget(im); vk_lrz_forget(im); if (im->lin_mem) nvn_dirty_release(im->lin_mem, im->lin_len); if (im->packaged && !im->pkg_released && im->pkg_mem) nvn_dirty_release(im->pkg_mem, im->pkg_len); g_img_n--; g_img_bytes -= im->size > 0 ? (uint64_t)im->size : 0; alias_unlink(im); pool_image_del(im); vk_tex_view_drop_all(im); if (im->sub) vk_defer_free_image_sub(im->img, im->sub); else vk_defer_free_image(im->img, im->mem); free(im); }
 static void evict_overlaps(uint64_t pool, int64_t off, int64_t size) {
     vkimg_t *images[64]; int n = 0;
     for (pool_image *e = nvn_hm_get(&g_by_pool, &pool); e && n < 64; e = e->next) {
@@ -435,7 +438,7 @@ static vkimg_t *vk_tex_(const tex_t *t, int copy_dst) {
         }
     } else if (first) {
         if (copy_dst) g_copy_dst_preparations++;
-        else vk_tex_prepare(vk_upload_cmd(), im);
+        else { vk_tex_prepare(vk_upload_cmd(), im); vk_gpu_upload_note(1, 0); }
     }
     return im;
 }
@@ -520,21 +523,88 @@ static int linear_tex(const tex_t *t) { return t->pool && (t->d.flags & (NVN_TEX
 // cleared or copied linear texture, until the CPU writes its storage again. The packaged path (linear_tex) still leaves them out: a re-upload there would replace a drawing
 static int linear_storage(const tex_t *t) { return t->pool && (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)); }
 extern uint64_t g_up_gen;
-static int lin_copy(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {   // 1 = the image holds its storage as of this upload buffer
+// PJD110: a linear upload path accounts for ~2.5 ms between main CB parts.
+// Only large, tracked, non-virtual, non-aliased CPU-source images are candidates.
+// Dirty pages alone are insufficient: buffer shader/transfer writes and in-flight
+// work also invalidate reuse. Mode 2 observes candidates while copying in full.
+enum { LC_CALL, LC_CLEAN, LC_PARTIAL, LC_FALLBACK, LC_FULL, LC_REGIONS, LC_BYTES, LC_AVOID, LC_N };
+static _Atomic uint64_t g_lc[LC_N];
+static void linear_cache_forget(vkimg_t *im) {
+    if (im->lc_mem) nvn_dirty_release(im->lc_mem, im->lc_len);
+    im->lc_mem = im->lc_span = NULL; im->lc_valid = 0; im->lc_len = 0;
+}
+// The dirty tracker releases a protect-call span on one CPU fault to bound
+// VMA fragmentation. One-megabyte spans preserve useful locality without a
+// separate read-only/writable mapping for every host page of a large atlas.
+static void linear_cache_protect(const void *mem, size_t len) {
+    uintptr_t a = (uintptr_t)mem; const size_t block = 1u << 20;
+    while (len) { size_t n = block - (a & (block - 1)); if (n > len) n = len;
+        nvn_dirty_protect((const void *)a, n); a += n; len -= n; }
+}
+void vk_linear_present(uint64_t frame) {
+    if (frame % 300 || !vk_linear_cache_mode()) return;
+    static uint64_t prev[LC_N]; uint64_t d[LC_N]; for (int i = 0; i < LC_N; i++) { d[i] = g_lc[i] - prev[i]; prev[i] = g_lc[i]; }
+    VKLOG("linear upload frames through %llu mode %d: candidates %llu clean %llu partial %llu fallback %llu full_copies %llu regions %llu pixel_bytes %llu candidate_avoided_bytes %llu (mode2 still copies in full)",
+        (unsigned long long)frame, vk_linear_cache_mode(), (unsigned long long)d[LC_CALL], (unsigned long long)d[LC_CLEAN], (unsigned long long)d[LC_PARTIAL], (unsigned long long)d[LC_FALLBACK],
+        (unsigned long long)d[LC_FULL], (unsigned long long)d[LC_REGIONS], (unsigned long long)d[LC_BYTES], (unsigned long long)d[LC_AVOID]);
+}
+static int lin_copy(vkimg_t *im, const tex_t *t, const vkfmt_t *f) {
     if (!linear_storage(t) || im->levels != 1 || im->d != 1 || im->layers != 1 || f->bw > 1 || f->bh > 1 || !f->bpb || im->aspect != VK_IMAGE_ASPECT_COLOR_BIT) return 0;
     size_t stride = t->d.stride ? t->d.stride : (size_t)im->w * f->bpb; VkBuffer b; VkDeviceSize o;
-    if (stride % f->bpb || stride < (size_t)im->w * f->bpb || !vk_buf_at((uint64_t)(uintptr_t)t->mem, (uint64_t)stride * (im->h - 1) + (uint64_t)im->w * f->bpb, &b, &o) || o % f->bpb) return 0;
-    // the GPU wrote it (a clear, a copy, a storage write): it holds that until the CPU writes its storage again, which its pages, set read-only, tell
+    if (!im->w || !im->h || stride % f->bpb || stride < (size_t)im->w * f->bpb || im->h > SIZE_MAX / stride ||
+        !vk_buf_at((uint64_t)(uintptr_t)t->mem, (uint64_t)stride * (im->h - 1) + (uint64_t)im->w * f->bpb, &b, &o) || o % f->bpb) return 0;
     size_t len = stride * (im->h - 1) + (size_t)im->w * f->bpb;
+    int mode = vk_linear_cache_mode(); uint64_t snapshot_stamp = mode ? nvn_dirty_now() : 0;
+    if (!mode || im->gpu_w) linear_cache_forget(im);
+    // Preserve the pre-existing GPU-written-image rule, independently of caching.
     if (im->gpu_w && !im->lin_mem) { nvn_dirty_protect(t->mem, len); im->lin_stamp = nvn_dirty_now(); im->lin_span = nvn_dirty_span(t->mem, len); im->lin_mem = t->mem; im->lin_len = len; return 1; }
     if (im->gpu_w) { if (!nvn_dirty_since_span(im->lin_span, t->mem, len, im->lin_stamp)) return 1; nvn_dirty_release(im->lin_mem, im->lin_len); im->lin_mem = NULL; im->gpu_w = 0; im->lin_gen = 0; }
+    int eligible = mode && len >= (1u << 20) && !(t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) && !im->novl && nvn_dirty_tracked(t->mem, len);
+    vk_linear_rows rows[VK_LINEAR_REGIONS]; int nr = -1; uint64_t pixel = (uint64_t)im->w * f->bpb * im->h, selected = pixel;
+    int pending = eligible && (vk_linear_writes_pending((uint64_t)(uintptr_t)t->mem, len) || vk_ubd_overlaps((uint64_t)(uintptr_t)t->mem, len));
+    if (eligible) {
+        g_lc[LC_CALL]++;
+        if (im->lc_valid && im->lc_mem == t->mem && im->lc_len == len && !pending &&
+            !vk_linear_writes_changed(im->lc_writes, (uint64_t)(uintptr_t)t->mem, len)) {
+            nvn_dirty_interval dirty[VK_LINEAR_REGIONS];
+            int n = nvn_dirty_collect(im->lc_span, t->mem, len, im->lc_stamp, dirty, VK_LINEAR_REGIONS);
+            nr = vk_linear_project(dirty, n, stride, im->h, o, rows);
+            if (nr >= 0) { selected = 0; for (int i = 0; i < nr; i++) selected += (uint64_t)rows[i].count * im->w * f->bpb;
+                if (!nr) g_lc[LC_CLEAN]++; else if (selected < pixel) g_lc[LC_PARTIAL]++;
+                g_lc[LC_AVOID] += pixel - selected;
+                if (!nr && mode == 1) {
+                    // Every event since lc_writes was checked and disjoint. Advance
+                    // that cursor, not the CPU stamp: unrelated old GPU events
+                    // need not cause periodic full uploads when the ring wraps.
+                    im->lc_writes = vk_linear_write_stamp(); return 1;
+                } // no upload CB, copy or orphan full barrier
+            }
+        }
+        if (nr < 0) g_lc[LC_FALLBACK]++;
+    } else linear_cache_forget(im);
     VkCommandBuffer cb = vk_upload_cmd();
     if (im->lin_gen == g_up_gen) return 1;
-    im->lin_gen = g_up_gen;
-    vk_img_barrier_all(cb);   // after the reads of earlier submissions
+    // Arm before recording the copy. Writes racing the earlier dirty-page scan
+    // stay newer than snapshot_stamp, including pages outside this row plan.
+    uint64_t stamp = 0, writes = 0; const void *span = NULL;
+    if (eligible && !pending) {
+        if (im->lc_mem && (im->lc_mem != t->mem || im->lc_len != len)) linear_cache_forget(im);
+        stamp = snapshot_stamp; linear_cache_protect(t->mem, len); span = nvn_dirty_span(t->mem, len); writes = vk_linear_write_stamp();
+    }
+    im->lin_gen = g_up_gen; vk_gpu_upload_note(2, (uint64_t)stride * im->h);
+    vk_img_barrier_all(cb);
     if (im->layout != VK_IMAGE_LAYOUT_GENERAL) vk_tex_prepare(cb, im);
-    VkBufferImageCopy r = {o, (uint32_t)(stride / f->bpb), 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {im->w, im->h, 1}};
-    vkCmdCopyBufferToImage(cb, b, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    VkBufferImageCopy copy[VK_LINEAR_REGIONS]; unsigned count = 1;
+    if (mode == 1 && nr > 0) { count = (unsigned)nr;
+        for (int i = 0; i < nr; i++) copy[i] = (VkBufferImageCopy){o + (VkDeviceSize)rows[i].first * stride, (uint32_t)(stride / f->bpb), 0,
+            {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, (int32_t)rows[i].first, 0}, {im->w, rows[i].count, 1}};
+    } else { selected = pixel; copy[0] = (VkBufferImageCopy){o, (uint32_t)(stride / f->bpb), 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {im->w, im->h, 1}}; }
+    vkCmdCopyBufferToImage(cb, b, im->img, VK_IMAGE_LAYOUT_GENERAL, count, copy);
+    if (mode) { g_lc[LC_FULL] += selected == pixel; g_lc[LC_REGIONS] += count; g_lc[LC_BYTES] += selected;
+        static unsigned info; if (info++ < 8) VKLOG("linear source: %ux%u format %d stride %zu source %p span %zu pixel_bytes %llu copied_rows_bytes %llu pending %d regions %u eligible %d aliases %d pool_flags %#x",
+            im->w, im->h, im->nvn_format, stride, t->mem, len, (unsigned long long)pixel, (unsigned long long)selected, pending, count, eligible, im->novl, t->pool->flags); }
+    if (eligible && !pending && span) { im->lc_mem = t->mem; im->lc_len = len; im->lc_span = span; im->lc_stamp = stamp; im->lc_writes = writes; im->lc_valid = 1; }
+    else im->lc_valid = 0;
     return 1;
 }
 // A texture the CPU filled before its first use, as nxnative's tex_cpu_content (nvn_mtl.m) takes it: a sampled block-compressed texture (BC and ASTC are not colour-renderable, so
@@ -844,7 +914,7 @@ VkImageView vk_dummy_view(int dim, int arrayed, int ms, int storage, int is_int)
             t.d.target = d == 0 ? 3 : d == 2 ? 2 : d == 3 ? 9 : ms ? 6 : 4; t.d.flags = storage ? NVN_TEXTURE_FLAGS_IMAGE : 0;
             if (d == 2) t.d.depth = 1;
             *pi = img_new(&t, vk_fmt(t.d.format));
-            VkCommandBuffer cb = vk_upload_cmd(); vk_tex_prepare(cb, *pi);
+            VkCommandBuffer cb = vk_upload_cmd(); vk_gpu_upload_note(3, 0); vk_tex_prepare(cb, *pi);
             VkClearColorValue z = {{0}}; VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, VK_REMAINING_ARRAY_LAYERS};
             if (!ms) vkCmdClearColorImage(cb, (*pi)->img, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &rg);
         }

@@ -38,6 +38,7 @@ static vkimg_t image;static vkfmt_t format={.bw=1,.bh=1,.bpb=4,.dbpp=4};
 static struct {int row_stride,image_stride;} S;
 static int64_t g_watch_off=-1;static int g_copy_dst_main=1;
 static vkimg_t *vk_tex_(const tex_t *,int);
+static void vk_gpu_upload_note(unsigned kind,uint64_t bytes){(void)kind;(void)bytes;}
 static VkCommandBuffer vk_upload_cmd(void){up_calls++;return (VkCommandBuffer)(uintptr_t)9;}
 static VkCommandBuffer vk_cmd(void){return (VkCommandBuffer)(uintptr_t)7;}
 static void vkCmdPipelineBarrier(VkCommandBuffer cb,VkPipelineStageFlags src,VkPipelineStageFlags dst,VkDependencyFlags dep,uint32_t nm,const VkMemoryBarrier *m,uint32_t nb,const VkBufferMemoryBarrier *b,uint32_t ni,const VkImageMemoryBarrier *i){
